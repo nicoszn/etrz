@@ -18,6 +18,7 @@ DOWNLOAD_DIR = Path("downloads")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 CLEANUP_AFTER_MINUTES = int(os.environ.get('CLEANUP_AFTER_MINUTES', 10))
 COOKIES_FILE = Path(os.environ.get("COOKIES_FILE", "./cookies.txt"))
+
 progress_store = {}
 
 HTML_TEMPLATE = """
@@ -43,7 +44,7 @@ HTML_TEMPLATE = """
             border-radius: 20px;
             box-shadow: 0 20px 60px rgba(0,0,0,0.3);
             padding: 40px;
-            max-width: 600px;
+            max-width: 700px;
             width: 100%;
         }
         h1 { color: #333; margin-bottom: 10px; font-size: 28px; }
@@ -61,13 +62,9 @@ HTML_TEMPLATE = """
         }
         button:hover { transform: translateY(-2px); box-shadow: 0 5px 20px rgba(102,126,234,0.4); }
         button:disabled { opacity: 0.6; cursor: not-allowed; transform: none; }
-        .quality-selector { margin-bottom: 20px; }
-        select {
-            width: 100%; padding: 12px; border: 2px solid #e0e0e0;
-            border-radius: 10px; font-size: 15px; background: white; cursor: pointer;
-        }
         .result { margin-top: 20px; }
         .video-info { background: #f5f5f5; padding: 20px; border-radius: 10px; margin-top: 20px; }
+        .video-info h3 { color: #333; margin-bottom: 10px; }
         .progress-bar { width: 100%; height: 8px; background: #e0e0e0; border-radius: 4px; overflow: hidden; margin-top: 10px; }
         .progress-fill { height: 100%; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); width: 0%; transition: width 0.3s; }
         .error { background: #ffebee; color: #c62828; padding: 15px; border-radius: 10px; margin-top: 20px; }
@@ -75,6 +72,14 @@ HTML_TEMPLATE = """
             display: inline-block; margin-top: 15px; background: #4caf50; color: white;
             padding: 12px 25px; border-radius: 8px; text-decoration: none; transition: all 0.3s;
         }
+        .format-list { max-height: 300px; overflow-y: auto; margin-top: 10px; }
+        .format-item {
+            display: block; padding: 10px; margin: 5px 0; background: white;
+            border: 2px solid #e0e0e0; border-radius: 8px; cursor: pointer;
+            transition: border-color 0.3s;
+        }
+        .format-item:hover { border-color: #667eea; }
+        .format-item input[type="radio"] { margin-right: 10px; }
     </style>
 </head>
 <body>
@@ -85,21 +90,6 @@ HTML_TEMPLATE = """
         <div class="input-group">
             <input type="text" id="urlInput" placeholder="Paste video URL here...">
             <button id="infoBtn" onclick="getVideoInfo()">Get Info</button>
-        </div>
-        
-        <div class="quality-selector" id="qualitySection" style="display: none;">
-            <label for="qualitySelect">Select Quality:</label>
-            <select id="qualitySelect">
-                <option value="best">Best Quality</option>
-                <option value="1080p">1080p</option>
-                <option value="720p">720p</option>
-                <option value="480p">480p</option>
-                <option value="360p">360p</option>
-                <option value="worst">Lowest Quality</option>
-            </select>
-            <button id="downloadBtn" onclick="startDownload()" style="width: 100%; margin-top: 15px;">
-                Download Video
-            </button>
         </div>
         
         <div id="result"></div>
@@ -127,7 +117,6 @@ HTML_TEMPLATE = """
                 else {
                     currentInfo = data;
                     displayVideoInfo(data);
-                    document.getElementById('qualitySection').style.display = 'block';
                 }
             } catch (error) { showError('Failed: ' + error.message); }
             finally { infoBtn.disabled = false; infoBtn.textContent = 'Get Info'; }
@@ -135,20 +124,63 @@ HTML_TEMPLATE = """
 
         function displayVideoInfo(info) {
             const result = document.getElementById('result');
+            
+            let formatsHtml = '<label style="font-weight: 500; margin-top: 10px; display: block;">Select Format:</label>';
+            formatsHtml += '<div class="format-list">';
+            
+            // Add combined formats first (video+audio in one stream)
+            const combinedFormats = info.formats.filter(f => f.acodec !== 'none' && f.vcodec !== 'none');
+            if (combinedFormats.length > 0) {
+                combinedFormats.forEach((f, index) => {
+                    const sizeStr = f.filesize && f.filesize !== 'N/A' ? (f.filesize / 1024 / 1024).toFixed(1) + ' MB' : 'Unknown size';
+                    formatsHtml += `
+                        <label class="format-item">
+                            <input type="radio" name="formatId" value="${f.format_id}" ${index === 0 ? 'checked' : ''}>
+                            <strong>${f.resolution}</strong> - ${f.ext} - Combined (${sizeStr})
+                        </label>`;
+                });
+            }
+            
+            // Add video-only formats
+            const videoFormats = info.formats.filter(f => f.acodec === 'none' && f.vcodec !== 'none');
+            if (videoFormats.length > 0) {
+                formatsHtml += '<p style="margin: 10px 0; color: #666;">Video only formats (audio will be merged):</p>';
+                videoFormats.forEach(f => {
+                    const sizeStr = f.filesize && f.filesize !== 'N/A' ? (f.filesize / 1024 / 1024).toFixed(1) + ' MB' : 'Unknown size';
+                    formatsHtml += `
+                        <label class="format-item">
+                            <input type="radio" name="formatId" value="${f.format_id}">
+                            <strong>${f.resolution}</strong> - ${f.ext} - Video Only (${sizeStr})
+                        </label>`;
+                });
+            }
+            
+            formatsHtml += '</div>';
+            
             result.innerHTML = `
                 <div class="video-info">
                     <h3>${info.title || 'Video Information'}</h3>
                     ${info.thumbnail ? `<img src="${info.thumbnail}" style="max-width: 100%; border-radius: 10px; margin: 10px 0;">` : ''}
                     <p><strong>Duration:</strong> ${info.duration || 'N/A'}</p>
                     <p><strong>Uploader:</strong> ${info.uploader || 'N/A'}</p>
-                    <p><strong>Available Formats:</strong> ${info.format_count || 'N/A'}</p>
+                    ${formatsHtml}
+                    <button id="downloadBtn" onclick="startDownload()" style="width: 100%; margin-top: 20px;">
+                        Download Selected Format
+                    </button>
                 </div>`;
         }
 
         function startDownload() {
             if (!currentInfo) return;
             const url = document.getElementById('urlInput').value;
-            const quality = document.getElementById('qualitySelect').value;
+            const selectedFormat = document.querySelector('input[name="formatId"]:checked');
+            
+            if (!selectedFormat) {
+                showError('Please select a format');
+                return;
+            }
+            
+            const formatId = selectedFormat.value;
             const downloadBtn = document.getElementById('downloadBtn');
             downloadBtn.disabled = true;
             downloadBtn.textContent = 'Downloading...';
@@ -163,7 +195,7 @@ HTML_TEMPLATE = """
             fetch('/api/download', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({url: url, quality: quality})
+                body: JSON.stringify({url: url, format_id: formatId})
             })
             .then(response => response.json())
             .then(data => {
@@ -201,6 +233,12 @@ HTML_TEMPLATE = """
 
         function showError(message) {
             document.getElementById('result').innerHTML = `<div class="error">❌ ${message}</div>`;
+            // Reset download button if exists
+            const downloadBtn = document.getElementById('downloadBtn');
+            if (downloadBtn) {
+                downloadBtn.disabled = false;
+                downloadBtn.textContent = 'Download Selected Format';
+            }
         }
     </script>
 </body>
@@ -212,14 +250,8 @@ class VideoDownloader:
         self.ydl_opts = {
             'quiet': True,
             'no_warnings': True,
-             'extractor_args': {
-            'youtube': {
-                'player_js_variant': 'tv',  # TV client bypasses some restrictions
-                'formats': 'missing_pot',
-            }
-        },
         }
-        # Add cookies if file exists
+        
         if COOKIES_FILE.exists():
             self.ydl_opts['cookiefile'] = str(COOKIES_FILE)
             print(f"Using cookies from: {COOKIES_FILE}")
@@ -227,31 +259,38 @@ class VideoDownloader:
             print(f"No cookies.txt found at {COOKIES_FILE}")
     
     def get_video_info(self, url):
+        """Extract video info including available formats"""
         with yt_dlp.YoutubeDL(self.ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
+            
+            formats = []
+            for f in info.get('formats', []):
+                if f.get('vcodec') != 'none' or f.get('acodec') != 'none':
+                    formats.append({
+                        'format_id': f['format_id'],
+                        'ext': f.get('ext'),
+                        'resolution': f.get('resolution') or f.get('format_note') or 'N/A',
+                        'filesize': f.get('filesize'),
+                        'vcodec': f.get('vcodec', 'none'),
+                        'acodec': f.get('acodec', 'none'),
+                        'format_note': f.get('format_note', ''),
+                    })
+            
             return {
                 'title': info.get('title'),
                 'duration': self._format_duration(info.get('duration')),
                 'uploader': info.get('uploader'),
                 'thumbnail': info.get('thumbnail'),
-                'format_count': len(info.get('formats', [])),
+                'formats': formats,
             }
     
-    def download_video(self, url, quality, download_id):
+    def download_video(self, url, format_id, download_id):
+        """Download using specific format ID"""
         output_template = str(DOWNLOAD_DIR / f'%(title)s-{download_id[:8]}.%(ext)s')
-        
-        format_map = {
-    'best': 'bv*+ba/b',  # Any best video + best audio, fallback to best combined
-    '1080p': 'bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[height<=1080]',
-    '720p': 'bv*[height<=720][ext=mp4]+ba[ext=m4a]/b[height<=720]',
-    '480p': 'bv*[height<=480][ext=mp4]+ba[ext=m4a]/b[height<=480]',
-    '360p': 'bv*[height<=360][ext=mp4]+ba[ext=m4a]/b[height<=360]',
-    'worst': 'wv*+wa/w',
-}
         
         opts = {
             **self.ydl_opts,
-            'format': format_map.get(quality, 'best'),
+            'format': f'{format_id}+bestaudio/best',
             'outtmpl': output_template,
             'progress_hooks': [self._progress_hook(download_id)],
             'merge_output_format': 'mp4',
@@ -271,6 +310,7 @@ class VideoDownloader:
         return download_id
     
     def _download_task(self, url, opts, download_id):
+        """Perform the actual download"""
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=True)
@@ -351,11 +391,14 @@ def get_video_info():
 def download_video():
     data = request.json
     url = data.get('url')
-    quality = data.get('quality', 'best')
+    format_id = data.get('format_id')
+    
     if not url: return jsonify({'error': 'URL is required'}), 400
+    if not format_id: return jsonify({'error': 'Format ID is required'}), 400
+    
     try:
         download_id = str(uuid.uuid4())
-        downloader.download_video(url, quality, download_id)
+        downloader.download_video(url, format_id, download_id)
         return jsonify({'download_id': download_id})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -381,3 +424,6 @@ def serve_download(download_id):
 @app.route('/health')
 def health():
     return jsonify({'status': 'healthy'})
+
+if __name__ == '__main__':
+    app.run(debug=False, host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
