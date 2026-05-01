@@ -212,6 +212,12 @@ class VideoDownloader:
         self.ydl_opts = {
             'quiet': True,
             'no_warnings': True,
+             'extractor_args': {
+            'youtube': {
+                'player_js_variant': 'tv',  # TV client bypasses some restrictions
+                'formats': 'missing_pot',
+            }
+        },
         }
         # Add cookies if file exists
         if COOKIES_FILE.exists():
@@ -235,13 +241,13 @@ class VideoDownloader:
         output_template = str(DOWNLOAD_DIR / f'%(title)s-{download_id[:8]}.%(ext)s')
         
         format_map = {
-            'best': 'bestvideo+bestaudio/best',
-            '1080p': 'bestvideo[height<=1080]+bestaudio/best[height<=1080]',
-            '720p': 'bestvideo[height<=720]+bestaudio/best[height<=720]',
-            '480p': 'bestvideo[height<=480]+bestaudio/best[height<=480]',
-            '360p': 'bestvideo[height<=360]+bestaudio/best[height<=360]',
-            'worst': 'worstvideo+worstaudio/worst',
-        }
+    'best': 'bv*+ba/b',  # Any best video + best audio, fallback to best combined
+    '1080p': 'bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[height<=1080]',
+    '720p': 'bv*[height<=720][ext=mp4]+ba[ext=m4a]/b[height<=720]',
+    '480p': 'bv*[height<=480][ext=mp4]+ba[ext=m4a]/b[height<=480]',
+    '360p': 'bv*[height<=360][ext=mp4]+ba[ext=m4a]/b[height<=360]',
+    'worst': 'wv*+wa/w',
+}
         
         opts = {
             **self.ydl_opts,
