@@ -84,7 +84,7 @@ HTML_TEMPLATE = """
 </head>
 <body>
     <div class="container">
-        <h1>🎬 Video Downloader</h1>
+        <h1>🎬 Video Download</h1>
         <p class="subtitle">Download videos from YouTube and 1000+ other platforms using yt-dlp</p>
         
         <div class="input-group">
