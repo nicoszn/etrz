@@ -2,4 +2,3 @@ fastapi
 uvicorn
 yt-dlp[default]
 yt-dlp-ejs
-ffmpeg
