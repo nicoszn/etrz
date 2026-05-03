@@ -1,4 +1,8 @@
 fastapi
 uvicorn
-yt-dlp[default]
+yt-dlp>=2026.03.17
 yt-dlp-ejs
+brotli
+certifi
+mutagen
+
