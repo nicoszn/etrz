@@ -1,13 +1,12 @@
 [phases.setup]
 nixPkgs = [
   "python311",
-  "nodejs_20",
+  "deno",
   "ffmpeg"
 ]
 
 [phases.install]
 cmds = [
-  "pip install --upgrade pip",
   "pip install -r requirements.txt"
 ]
 
