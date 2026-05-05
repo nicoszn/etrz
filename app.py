@@ -96,7 +96,7 @@ def build_ydl_opts(extra: dict = None) -> dict:
         # Remote components allow on‑the‑fly npm downloads (needs deno/bun).
         "remote_components": ["ejs:npm"],
         # Impersonation (if curl_cffi is installed)
-        "impersonate": "chrome:windows",
+        "impersonate": "",
     }
 
     # Merge extra options
