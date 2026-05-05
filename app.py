@@ -60,7 +60,7 @@ def get_yt_dlp_options(download_id: str = None, progress_hook=None):
         'no_warnings': True,
         'format': 'best',
         # Modern Anti-Bot Measures
-        'impersonate': 'chrome',  # Uses curl_cffi for TLS fingerprinting
+        'impersonate': '',  # Uses curl_cffi for TLS fingerprinting
         'extractor_args': {
             'youtube': {
                 'player_client': ['android', 'web'],
