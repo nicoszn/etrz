@@ -1,6 +1,6 @@
 fastapi
 uvicorn[standard]
-yt-dlp[default]>=2026.03.17
+yt-dlp[standard]>=2026.03.17
 yt-dlp-ejs>=0.8.0
 brotli
 certifi
