@@ -2,7 +2,7 @@
 nixPkgs = [
   "python311",
   "deno",
-  "ffmpeg"
+  "ffmpeg-full"
 ]
 
 [phases.install]
