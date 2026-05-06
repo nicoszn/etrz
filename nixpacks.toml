@@ -16,4 +16,4 @@ cmds = [
 ]
 
 [start]
-cmd = "uvicorn app:app --host 0.0.0.0 --port $PORT"
+cmd = "export PATH=$PATH:/usr/bin:/nix/var/nix/profiles/default/bin && uvicorn app:app --host 0.0.0.0 --port $PORT"
