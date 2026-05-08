@@ -149,7 +149,7 @@ def download_video(url: str, download_id: str, format_id: Optional[str], use_coo
 
     ydl_opts = {
         **BASE_OPTS,
-        "format": "b",
+       # "format": "b",
         "format_sort": [
             'vcodec:h264', 
             'res',      # Aim for 1080p specifically
