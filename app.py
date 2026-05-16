@@ -453,10 +453,10 @@ async def get_os():
 def health():
     return {"status": "ok"}
 
-#if __name__ == "__main__":
- #   print("[INFO] Starting server setup...")
-  #  if not setup_ffmpeg():
-  #      print("[WARN] Server will run but format merging (video+audio) may fail.")
-   # else:
-  #      print("[INFO] Setup complete. Starting server on http://0.0.0.0:8000")
- #   uvicorn.run(app, host="0.0.0.0", port=8000)
+if __name__ == "__main__":
+    print("[INFO] Starting server setup...")
+    if not setup_ffmpeg():
+        print("[WARN] Server will run but format merging (video+audio) may fail.")
+    else:
+        print("[INFO] Setup complete. Starting server on http://0.0.0.0:8000")
+    uvicorn.run(app, host="0.0.0.0", port=8000)
