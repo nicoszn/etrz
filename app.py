@@ -1,12 +1,19 @@
 # app.py — yt-dlp FastAPI server (v5.0.1, >= 2026.03.17 compliant)
 
 import os
+import subprocess
+import stat
+import tarfile
+import lzma
+import json
 import platform
 import asyncio
 import threading
 import time
 import shutil
 import uuid
+from urllib.request import urlopen, Request
+from urllib.error import URLError
 from pathlib import Path
 from typing import Optional, List, Dict
 
@@ -30,7 +37,11 @@ print(f"Release: {platform.release()}")            # e.g. 5.15.0-1061-aws
 print(f"Version: {platform.version()}")            # full version string
 print(f"Architecture: {platform.machine()}")       # e.g. x86_64
 
-
+FFMPEG_DIR = Path("ffmpeg_bin")
+FFMPEG_PATH = FFMPEG_DIR / "ffmpeg"
+FFPROBE_PATH = FFMPEG_DIR / "ffprobe"
+VERSION_FILE = FFMPEG_DIR / "version.txt"
+print("FFMPEG_LOCATION:", shutil.which("FFMPEG_PATH"))
 progress_store: Dict[str, dict] = {}
 VERBOSE = os.environ.get("YTDLP_VERBOSE", "0") == "1"
 
@@ -63,6 +74,65 @@ class InfoRequest(BaseModel):
 class DownloadRequest(BaseModel):
     url: str
     format_id: Optional[str] = None
+
+
+def _get_latest_ffmpeg_version():
+    """Return the latest release tag from yt-dlp/FFmpeg-Builds, or None on failure."""
+    try:
+        req = Request(
+            "https://api.github.com/repos/yt-dlp/FFmpeg-Builds/releases/latest",
+            headers={"Accept": "application/vnd.github+json"}
+        )
+        with urlopen(req, timeout=10) as resp:
+            data = json.load(resp)
+            return data["tag_name"]
+    except Exception as e:
+        print(f"[SETUP] Could not fetch latest ffmpeg version: {e}")
+        return None
+
+def setup_ffmpeg():
+    """Ensures ffmpeg is present, updating only if a newer version exists."""
+    # Already installed and version file matches latest?
+    if FFMPEG_PATH.exists() and FFPROBE_PATH.exists() and VERSION_FILE.exists():
+        installed_version = VERSION_FILE.read_text().strip()
+        latest_version = _get_latest_ffmpeg_version()
+        if latest_version and installed_version == latest_version:
+            print(f"[SETUP] ffmpeg is up‑to‑date (version {installed_version})")
+            return True
+        else:
+            print("[SETUP] New ffmpeg version detected or version check skipped – updating…")
+
+    # Download and extract
+    try:
+        url = "https://github.com/yt-dlp/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz"
+        print(f"[SETUP] Downloading ffmpeg…")
+        subprocess.check_call(["curl", "-fsSL", url, "-o", "ffmpeg.tar.xz"])
+
+        print(f"[SETUP] Extracting ffmpeg…")
+        FFMPEG_DIR.mkdir(exist_ok=True)
+        with lzma.open("ffmpeg.tar.xz") as f:
+            with tarfile.open(fileobj=f) as tar:
+                for member in tar.getmembers():
+                    if member.name.endswith(('/ffmpeg', '/ffprobe')):
+                        member.name = Path(member.name).name
+                        tar.extract(member, path=FFMPEG_DIR)
+
+        os.chmod(FFMPEG_PATH, FFMPEG_PATH.stat().st_mode | stat.S_IEXEC)
+        os.chmod(FFPROBE_PATH, FFPROBE_PATH.stat().st_mode | stat.S_IEXEC)
+
+        # Write version marker
+        latest_version = _get_latest_ffmpeg_version()
+        if latest_version:
+            VERSION_FILE.write_text(latest_version)
+        else:
+            # fallback: just note we have a binary
+            VERSION_FILE.write_text("unknown")
+
+        print("[SETUP] ffmpeg is ready.")
+        return True
+    except Exception as e:
+        print(f"[ERROR] Failed to set up ffmpeg: {e}")
+        return False
 
 # ── Logic Helpers ─────────────────────────────────────
 
@@ -181,6 +251,7 @@ def download_video(url: str, download_id: str, format_id: Optional[str], use_coo
         "outtmpl": output_template,
         "progress_hooks": [hook],
       #  "merge_output_format": "mp4",
+       # "ffmpeg_location": str(FFMPEG_PATH), # Points directly to the binary
     }
     print(f"Opts: {ydl_opts}. ...")
     if use_cookies and COOKIES_FILE.exists():
@@ -381,3 +452,11 @@ async def get_os():
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+#if __name__ == "__main__":
+ #   print("[INFO] Starting server setup...")
+  #  if not setup_ffmpeg():
+  #      print("[WARN] Server will run but format merging (video+audio) may fail.")
+   # else:
+  #      print("[INFO] Setup complete. Starting server on http://0.0.0.0:8000")
+ #   uvicorn.run(app, host="0.0.0.0", port=8000)
