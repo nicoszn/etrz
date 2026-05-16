@@ -44,11 +44,11 @@ COOKIES_FILE = Path(os.environ.get("COOKIES_FILE", "./cookies.txt"))
 #print(f"Version: {platform.version()}")            # full version string
 #print(f"Architecture: {platform.machine()}")       # e.g. x86_64
 
-FFMPEG_DIR = Path("ffmpeg_bin")
-FFMPEG_PATH = FFMPEG_DIR / "ffmpeg"
-FFPROBE_PATH = FFMPEG_DIR / "ffprobe"
-VERSION_FILE = FFMPEG_DIR / "version.txt"
-print("FFMPEG_LOCATION:", shutil.which("FFMPEG_PATH"))
+#FFMPEG_DIR = Path("ffmpeg_bin")
+#FFMPEG_PATH = FFMPEG_DIR / "ffmpeg"
+#FFPROBE_PATH = FFMPEG_DIR / "ffprobe"
+#_FILE = FFMPEG_DIR / "version.txt"
+p#rint("FFMPEG_LOCATION:", shutil.which("FFMPEG_PATH"))
 progress_store: Dict[str, dict] = {}
 VERBOSE = os.environ.get("YTDLP_VERBOSE", "0") == "1"
 
