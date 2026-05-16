@@ -39,11 +39,12 @@ BASE_OPTS = {
     # 2026 JS runtime — 'path': None lets yt-dlp auto-detect the deno binary on PATH
     "js_runtimes": {
         "deno": {"path": None},
+        "node": {"path": None},
     },
     "extractor_args": {
         "youtube": {
             # web/android clients honour cookiefile; ios does not — keep clients cookie-compatible
-            "player_client": ["web", "android"],
+            "player_client": ["default"],
             "remote_components": ["ejs:github"],
         },
     },
