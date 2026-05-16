@@ -1,4 +1,4 @@
-# app.py — yt-dlp FastAPI server (v5.0.1, >= 2026.03.17 compliant)
+# app.py — yt-dlp FastAPI server (v5.0.2, >= 2026.03.17 compliant)
 
 import os
 import subprocess
