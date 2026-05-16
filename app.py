@@ -1,6 +1,7 @@
 # app.py — yt-dlp FastAPI server (v5.0.1, >= 2026.03.17 compliant)
 
 import os
+import platform
 import asyncio
 import threading
 import time
@@ -23,6 +24,12 @@ DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
 print("FFMPEG PATH:", shutil.which("ffmpeg"))
 CLEANUP_AFTER_MINUTES = int(os.environ.get("CLEANUP_AFTER_MINUTES", 10))
 COOKIES_FILE = Path(os.environ.get("COOKIES_FILE", "./cookies.txt"))
+
+print(f"OS: {platform.system()}")                  # e.g. Linux
+print(f"Release: {platform.release()}")            # e.g. 5.15.0-1061-aws
+print(f"Version: {platform.version()}")            # full version string
+print(f"Architecture: {platform.machine()}")       # e.g. x86_64
+
 
 progress_store: Dict[str, dict] = {}
 VERBOSE = os.environ.get("YTDLP_VERBOSE", "0") == "1"
@@ -362,6 +369,14 @@ async def serve(download_id: str):
     if not path.exists():
         raise HTTPException(404, "file missing")
     return FileResponse(path=str(path), filename=data["filename"])
+
+@app.get("/os")
+async def get_os():
+    return {
+        "os": platform.system(),
+        "release": platform.release(),
+        "version": platform.version(),
+    }
 
 @app.get("/health")
 def health():
