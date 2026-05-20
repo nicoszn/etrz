@@ -535,5 +535,11 @@ async def download_clip(filename: str):
     return FileResponse(str(path), media_type="video/mp4", filename=filename)
 
 
+@app.get("/health")
+async def health_check():
+    """Lightweight endpoint for Render zero-downtime deployment checks"""
+    return {"status": "healthy", "service": "ClipForge"}
+
+
 if __name__ == "__main__":
     uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=False, workers=1)
