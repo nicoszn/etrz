@@ -16,6 +16,11 @@ RUN apt-get update && apt-get install -y \
     xz-utils \
     && rm -rf /var/lib/apt/lists/*
 
+# Install static FFmpeg and FFprobe binaries (yt-dlp needs these)
+RUN mkdir -p /opt/ffmpeg \
+    && curl -L https://johnvansickle.com | tar -xJ -C /opt/ffmpeg --strip-components=1 \
+    && ln -s /opt/ffmpeg/ffmpeg /usr/local/bin/ffmpeg \
+    && ln -s /opt/ffmpeg/ffprobe /usr/local/bin/ffprobe
 
 # Copy dependency manifests first for layer caching
 COPY requirements.txt .
