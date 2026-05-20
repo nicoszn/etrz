@@ -1,4 +1,5 @@
 fastApi
+gunicorn
 uvicorn[standard]
 yt-dlp[default]
 opencv-python-headless
