@@ -6,3 +6,5 @@ opencv-python-headless
 pillow
 numpy
 pydantic
+jinja2
+python-multipart
