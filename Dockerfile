@@ -8,18 +8,14 @@ ENV PIP_NO_CACHE_DIR=1
 
 WORKDIR /app
 
-# System dependencies
+# System dependencies (Only what pip/ffmpeg needs)
 RUN apt-get update && apt-get install -y \
-    ffmpeg \
     fonts-dejavu-core \
     curl \
     ca-certificates \
+    xz-utils \
     && rm -rf /var/lib/apt/lists/*
 
-# Install yt-dlp binary
-RUN curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp \
-    -o /usr/local/bin/yt-dlp \
-    && chmod a+rx /usr/local/bin/yt-dlp
 
 # Copy dependency manifests first for layer caching
 COPY requirements.txt .
