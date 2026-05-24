@@ -7,6 +7,6 @@
   },
   "deploy": {
     "aptPackages": ["ffmpeg", "libgl1", "libglib2.0-0", "fonts-dejavu-core"],
-    "startCommand": "uvicorn app:app --host 0.0.0.0 --port $PORT--workers 1"
+    "startCommand": "uvicorn app:app --host 0.0.0.0 --port $PORT --workers 1"
   }
 }
