@@ -536,9 +536,10 @@ async def download_clip(filename: str):
 
 
 @app.get("/health")
-def health_check(request: Request):
+async def health_check():
     """Lightweight endpoint for Render zero-downtime deployment checks"""
-    return {"status": "healthy", "service": "ClipForge"}
+   # return {"status": "healthy", "service": "ClipForge"}
+    return HTMLResponse(200)
 
 
 if __name__ == "__main__":
