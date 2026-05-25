@@ -1,4 +1,5 @@
 import os
+import re
 import uuid
 import subprocess
 import threading
@@ -15,9 +16,11 @@ BASE_DIR    = Path(__file__).parent
 COOKIES     = BASE_DIR / "cookies.txt"
 DOWNLOADS   = BASE_DIR / "downloads"
 CLIPS       = BASE_DIR / "clips"
+TEMP        = BASE_DIR / "temp"
 
 DOWNLOADS.mkdir(exist_ok=True)
 CLIPS.mkdir(exist_ok=True)
+TEMP.mkdir(exist_ok=True)
 
 app = FastAPI(title="ClipForge")
 
@@ -39,9 +42,24 @@ def ytdlp_base() -> list:
         cmd += ["--cookies", str(COOKIES)]
     return cmd
 
+def extract_subtitle_text(vtt_path: Path) -> str:
+    """Extract plain text from a WebVTT subtitle file."""
+    if not vtt_path.exists():
+        return ""
+    lines = []
+    with open(vtt_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if line and not ('-->' in line or line.startswith('WEBVTT') or line.isdigit()):
+                clean = re.sub(r'<[^>]+>', '', line)
+                if clean:
+                    lines.append(clean)
+    return ' '.join(lines)
+
 def download_worker(job_id: str, url: str):
+    """Download video + subtitles."""
     try:
-        # Get metadata first
+        # Metadata
         meta_cmd = ytdlp_base() + ["--dump-json", "--no-playlist", url]
         meta_res = subprocess.run(meta_cmd, capture_output=True, text=True, timeout=60)
         if meta_res.returncode != 0:
@@ -53,39 +71,93 @@ def download_worker(job_id: str, url: str):
         title    = meta.get("title", "untitled")
         duration = meta.get("duration", 0)
 
-        # Sanitize title for filename
         safe_title = "".join(c for c in title if c.isalnum() or c in " -_").strip()[:60]
         out_file   = DOWNLOADS / f"{video_id}_{safe_title}.mp4"
 
         if out_file.exists():
+            vtt_path = out_file.with_suffix('.en.vtt')
+            sub_text = extract_subtitle_text(vtt_path) if vtt_path.exists() else ""
+            vtt_path.unlink(missing_ok=True)
             job_set(job_id, "done", {
                 "video_id": video_id,
                 "title": title,
                 "duration": duration,
                 "filename": out_file.name,
+                "subtitle_text": sub_text,
             })
             return
 
+        # Download video with H.264/AAC
         dl_cmd = ytdlp_base() + [
-           "-S", "vcodec:h264,res,acodec:aac",  # Prefer H.264 video, AAC audio
-           "--merge-output-format", "mp4",      # Force the container to be MP4
-           "--no-playlist",
-           "-o", str(out_file),
-           url
-          ]
+            "-S", "vcodec:h264,res,acodec:aac",
+            "--merge-output-format", "mp4",
+            "--no-playlist",
+            "-o", str(out_file),
+            url
+        ]
         result = subprocess.run(dl_cmd, capture_output=True, text=True, timeout=600)
         if result.returncode != 0:
             raise RuntimeError(result.stderr.strip()[-400:])
+
+        # Download subtitles
+        vtt_path = out_file.with_suffix('.en.vtt')
+        sub_cmd = ytdlp_base() + [
+            "--skip-download",
+            "--write-auto-subs",
+            "--write-subs",
+            "--sub-langs", "en",
+            "--sub-format", "vtt",
+            "-o", str(out_file.with_suffix('')),
+            url
+        ]
+        subprocess.run(sub_cmd, capture_output=True, timeout=60)
+        sub_text = extract_subtitle_text(vtt_path)
+        vtt_path.unlink(missing_ok=True)
 
         job_set(job_id, "done", {
             "video_id": video_id,
             "title": title,
             "duration": duration,
             "filename": out_file.name,
+            "subtitle_text": sub_text,
         })
     except Exception as ex:
         job_set(job_id, "error", error=str(ex))
 
+def subtitle_only_worker(job_id: str, url: str):
+    """Download only subtitles (no video)."""
+    try:
+        # Get video title for display
+        meta_cmd = ytdlp_base() + ["--dump-json", "--no-playlist", url]
+        meta_res = subprocess.run(meta_cmd, capture_output=True, text=True, timeout=60)
+        if meta_res.returncode != 0:
+            raise RuntimeError(meta_res.stderr.strip()[:400])
+        import json
+        meta = json.loads(meta_res.stdout.strip().splitlines()[-1])
+        title = meta.get("title", "untitled")
+
+        # Temp file for subtitle
+        tmp_base = TEMP / f"sub_{job_id}"
+        sub_cmd = ytdlp_base() + [
+            "--skip-download",
+            "--write-auto-subs",
+            "--write-subs",
+            "--sub-langs", "en",
+            "--sub-format", "vtt",
+            "-o", str(tmp_base),
+            url
+        ]
+        subprocess.run(sub_cmd, capture_output=True, timeout=60)
+        vtt_path = Path(str(tmp_base) + ".en.vtt")
+        sub_text = extract_subtitle_text(vtt_path)
+        vtt_path.unlink(missing_ok=True)
+
+        job_set(job_id, "done", {
+            "title": title,
+            "subtitle_text": sub_text,
+        })
+    except Exception as ex:
+        job_set(job_id, "error", error=str(ex))
 
 def cut_worker(job_id: str, source_filename: str, ts_from: str, ts_to: str):
     try:
@@ -96,9 +168,6 @@ def cut_worker(job_id: str, source_filename: str, ts_from: str, ts_to: str):
         clip_name = f"clip_{uuid.uuid4().hex[:8]}_{ts_from.replace(':','-')}_{ts_to.replace(':','-')}.mp4"
         out_file  = CLIPS / clip_name
 
-        # Pre-seek before -i = fast keyframe jump, no full decode.
-        # -c copy = stream copy, no re-encode. Near-instant for any clip length.
-        # The double -ss trick: outer seeks to keyframe, inner trims precisely.
         cmd = [
             "ffmpeg", "-y",
             "-ss", ts_from,
@@ -122,7 +191,7 @@ def cut_worker(job_id: str, source_filename: str, ts_from: str, ts_to: str):
         job_set(job_id, "error", error=str(ex))
 
 # ---------------------------------------------------------------------------
-# INLINE HTML
+# INLINE HTML (with subtitle-only button)
 # ---------------------------------------------------------------------------
 HTML = r"""<!DOCTYPE html>
 <html lang="en">
@@ -141,7 +210,7 @@ body{background:var(--bg);color:var(--text);font-family:'SF Mono','Fira Code','C
 header{padding:16px 32px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:14px}
 header h1{font-size:17px;font-weight:700;letter-spacing:.06em;background:linear-gradient(135deg,var(--accent),var(--accent2));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
 .badge{font-size:10px;color:var(--muted);border:1px solid var(--border);padding:2px 8px;border-radius:4px}
-.main{max-width:760px;margin:40px auto;padding:0 24px;display:flex;flex-direction:column;gap:28px}
+.main{max-width:860px;margin:40px auto;padding:0 24px;display:flex;flex-direction:column;gap:28px}
 .card{background:var(--surface);border:1px solid var(--border);border-radius:12px;overflow:hidden}
 .card-header{padding:16px 20px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px}
 .card-header .num{width:24px;height:24px;border-radius:6px;background:var(--accent);color:#fff;font-size:11px;font-weight:700;display:flex;align-items:center;justify-content:center}
@@ -156,6 +225,7 @@ button{background:var(--accent);color:#fff;border:none;padding:10px 20px;border-
 button:hover{opacity:.85}
 button:active{transform:scale(.97)}
 button.sec{background:var(--surface2);border:1px solid var(--border);color:var(--text)}
+button.subtitle-btn{background:#3b3b5c;border-color:#5a5a7a}
 button.ok-btn{background:#2a6b4a}
 button:disabled{opacity:.35;cursor:not-allowed}
 .pw{background:var(--border);border-radius:4px;height:3px;overflow:hidden}
@@ -164,44 +234,52 @@ button:disabled{opacity:.35;cursor:not-allowed}
 @keyframes spin{0%{transform:translateX(-100%)}100%{transform:translateX(380%)}}
 .msg{font-size:11px;color:var(--muted);min-height:16px;line-height:1.5}
 .msg.ok{color:var(--ok)}.msg.err{color:var(--err)}
-.info-box{background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:14px 16px;display:none}
+.info-box{background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:14px 16px;margin-top:12px}
 .info-box .vt{font-weight:600;font-size:13px;margin-bottom:4px}
 .info-box .vm{font-size:11px;color:var(--muted)}
-.ts-row{display:grid;grid-template-columns:1fr 1fr;gap:10px}
-.dl-row{display:flex;gap:8px;flex-wrap:wrap}
-.sep{height:1px;background:var(--border)}
-.hint{font-size:11px;color:var(--muted);line-height:1.6}
+.subtitle-box{background:var(--surface2);border:1px solid var(--border);border-radius:8px;margin-top:12px;padding:12px;position:relative}
+.subtitle-box .lbl{font-size:10px;margin-bottom:6px;display:flex;justify-content:space-between;align-items:center}
+.subtitle-box textarea{width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:10px;border-radius:6px;font-family:inherit;font-size:12px;resize:vertical}
+.copy-btn{background:var(--surface2);border:1px solid var(--border);padding:4px 10px;border-radius:6px;font-size:10px;cursor:pointer}
+.copy-btn:hover{background:var(--accent);color:#000}
 </style>
 </head>
 <body>
 <header>
   <h1>⬡ CLIPFORGE</h1>
-  <span class="badge">yt-dlp · FFmpeg</span>
+  <span class="badge">yt-dlp · FFmpeg · Subtitles</span>
 </header>
 
 <div class="main">
 
-  <!-- STEP 1: DOWNLOAD -->
+  <!-- STEP 1: DOWNLOAD VIDEO + SUBTITLES -->
   <div class="card">
     <div class="card-header">
       <div class="num">1</div>
-      <div class="title">Download Video</div>
+      <div class="title">Download Video + Subtitles</div>
     </div>
     <div class="card-body">
       <div>
         <label class="lbl">YouTube URL</label>
         <div class="row">
-          <input type="text" id="url-input" placeholder="https://youtube.com/watch?v=  or  youtu.be/..."/>
+          <input type="text" id="url-input" placeholder="https://youtube.com/watch?v=..."/>
           <button id="dl-btn" onclick="startDownload()">Download</button>
+          <button class="subtitle-btn" onclick="fetchSubtitlesOnly()" style="background:#3b3b5c">📝 Subtitles Only</button>
         </div>
       </div>
       <div class="pw"><div class="pb" id="dl-pb"></div></div>
       <div class="msg" id="dl-msg"></div>
-      <div class="info-box" id="dl-info">
+      <div class="info-box" id="dl-info" style="display:none">
         <div class="vt" id="dl-title"></div>
         <div class="vm" id="dl-meta"></div>
-        <div style="margin-top:12px" class="dl-row">
-          <button class="sec" id="dl-full-btn" onclick="downloadFull()" disabled>⬇ Download Full Video</button>
+        <div class="dl-row" style="margin-top:12px">
+          <button class="sec" id="dl-full-btn" onclick="downloadFull()" disabled>⬇ Download Video</button>
+        </div>
+        <div id="subtitle-area" style="display:none" class="subtitle-box">
+          <div class="lbl">📝 Transcript (English)
+            <button class="copy-btn" onclick="copySubtitle()">Copy Text</button>
+          </div>
+          <textarea id="subtitle-text" rows="6" readonly placeholder="Subtitle text will appear here..."></textarea>
         </div>
       </div>
     </div>
@@ -214,7 +292,7 @@ button:disabled{opacity:.35;cursor:not-allowed}
       <div class="title">Cut Clip</div>
     </div>
     <div class="card-body">
-      <div class="hint">After downloading, set timestamps and cut a clip from the video.</div>
+      <div class="hint">After downloading a video, set timestamps and cut a clip.</div>
       <div class="ts-row">
         <div>
           <label class="lbl">From (HH:MM:SS.mmm)</label>
@@ -230,7 +308,7 @@ button:disabled{opacity:.35;cursor:not-allowed}
       </div>
       <div class="pw"><div class="pb" id="cut-pb"></div></div>
       <div class="msg" id="cut-msg"></div>
-      <div class="info-box" id="cut-info">
+      <div class="info-box" id="cut-info" style="display:none">
         <div class="vt" id="cut-title"></div>
         <div style="margin-top:10px">
           <button class="ok-btn" id="cut-dl-btn" onclick="downloadClip()" disabled>⬇ Download Clip</button>
@@ -244,6 +322,7 @@ button:disabled{opacity:.35;cursor:not-allowed}
 <script>
 let currentFilename = null;
 let currentClipFilename = null;
+let currentSubtitle = '';
 
 function setMsg(id, cls, txt) {
   const el = document.getElementById(id);
@@ -294,18 +373,20 @@ async function startDownload() {
   const url = document.getElementById('url-input').value.trim();
   if (!url) return;
 
-  currentFilename     = null;
+  currentFilename = null;
   currentClipFilename = null;
+  currentSubtitle = '';
 
-  document.getElementById('dl-btn').disabled  = true;
+  document.getElementById('dl-btn').disabled = true;
   document.getElementById('cut-btn').disabled = true;
-  document.getElementById('dl-info').style.display  = 'none';
+  document.getElementById('dl-info').style.display = 'none';
   document.getElementById('cut-info').style.display = 'none';
+  document.getElementById('subtitle-area').style.display = 'none';
   document.getElementById('dl-pb').style.width = '0%';
-  setMsg('dl-msg', '', 'Fetching and downloading…');
+  setMsg('dl-msg', '', 'Downloading video and subtitles...');
 
   try {
-    const res  = await fetch('/api/download', {
+    const res = await fetch('/api/download', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ url })
@@ -314,13 +395,65 @@ async function startDownload() {
 
     poll(data.job_id, 'dl-pb', 'dl-msg', (d) => {
       currentFilename = d.filename;
+      currentSubtitle = d.subtitle_text || '';
       setMsg('dl-msg', 'ok', '✓ Ready — ' + d.filename);
       document.getElementById('dl-title').textContent = d.title;
-      document.getElementById('dl-meta').textContent  = 'Duration: ' + fmtDuration(d.duration) + '  ·  ' + d.filename;
+      document.getElementById('dl-meta').textContent = 'Duration: ' + fmtDuration(d.duration) + '  ·  ' + d.filename;
       document.getElementById('dl-info').style.display = '';
-      document.getElementById('dl-full-btn').disabled  = false;
-      document.getElementById('dl-btn').disabled       = false;
-      document.getElementById('cut-btn').disabled      = false;
+      document.getElementById('dl-full-btn').disabled = false;
+      document.getElementById('cut-btn').disabled = false;
+      document.getElementById('dl-btn').disabled = false;
+
+      if (currentSubtitle) {
+        document.getElementById('subtitle-area').style.display = '';
+        document.getElementById('subtitle-text').value = currentSubtitle;
+      }
+    }, () => {
+      document.getElementById('dl-btn').disabled = false;
+    });
+  } catch(e) {
+    document.getElementById('dl-btn').disabled = false;
+    setMsg('dl-msg', 'err', '✗ Request failed');
+  }
+}
+
+async function fetchSubtitlesOnly() {
+  const url = document.getElementById('url-input').value.trim();
+  if (!url) { setMsg('dl-msg', 'err', '✗ Enter a YouTube URL'); return; }
+
+  document.getElementById('dl-btn').disabled = true;
+  document.getElementById('cut-btn').disabled = true;
+  document.getElementById('dl-info').style.display = 'none';
+  document.getElementById('cut-info').style.display = 'none';
+  document.getElementById('subtitle-area').style.display = 'none';
+  document.getElementById('dl-pb').style.width = '0%';
+  setMsg('dl-msg', '', 'Fetching subtitles only...');
+
+  try {
+    const res = await fetch('/api/subtitles-only', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url })
+    });
+    const data = await res.json();
+
+    poll(data.job_id, 'dl-pb', 'dl-msg', (d) => {
+      currentSubtitle = d.subtitle_text || '';
+      setMsg('dl-msg', 'ok', `✓ Subtitles ready: ${d.title}`);
+      document.getElementById('dl-title').textContent = d.title;
+      document.getElementById('dl-meta').textContent = 'Subtitles only (no video)';
+      document.getElementById('dl-info').style.display = '';
+      document.getElementById('dl-full-btn').disabled = true;  // no video to download
+      document.getElementById('cut-btn').disabled = true;      // can't cut without video
+      document.getElementById('dl-btn').disabled = false;
+
+      if (currentSubtitle) {
+        document.getElementById('subtitle-area').style.display = '';
+        document.getElementById('subtitle-text').value = currentSubtitle;
+      } else {
+        document.getElementById('subtitle-area').style.display = '';
+        document.getElementById('subtitle-text').value = 'No English subtitles found.';
+      }
     }, () => {
       document.getElementById('dl-btn').disabled = false;
     });
@@ -338,13 +471,13 @@ async function startCut() {
   if (!from || !to) { setMsg('cut-msg', 'err', '✗ Both timestamps required'); return; }
 
   currentClipFilename = null;
-  document.getElementById('cut-btn').disabled  = true;
+  document.getElementById('cut-btn').disabled = true;
   document.getElementById('cut-info').style.display = 'none';
   document.getElementById('cut-pb').style.width = '0%';
-  setMsg('cut-msg', '', 'Cutting clip…');
+  setMsg('cut-msg', '', 'Cutting clip...');
 
   try {
-    const res  = await fetch('/api/cut', {
+    const res = await fetch('/api/cut', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ source_filename: currentFilename, ts_from: from, ts_to: to })
@@ -356,9 +489,9 @@ async function startCut() {
       setMsg('cut-msg', 'ok', `✓ Clip ready — ${d.from} → ${d.to}`);
       document.getElementById('cut-title').textContent = d.clip_filename;
       document.getElementById('cut-info').style.display = '';
-      document.getElementById('cut-dl-btn').disabled    = false;
-      document.getElementById('cut-btn').disabled       = false;
-      downloadClip(); // auto-download
+      document.getElementById('cut-dl-btn').disabled = false;
+      document.getElementById('cut-btn').disabled = false;
+      downloadClip();  // auto-download
     }, () => {
       document.getElementById('cut-btn').disabled = false;
     });
@@ -369,11 +502,25 @@ async function startCut() {
 }
 
 function downloadFull() {
-  if (currentFilename) window.location.href = '/api/download-file/video/' + encodeURIComponent(currentFilename);
+  if (currentFilename) {
+    window.location.href = '/api/download-file/video/' + encodeURIComponent(currentFilename);
+  }
 }
 
 function downloadClip() {
-  if (currentClipFilename) window.location.href = '/api/download-file/clip/' + encodeURIComponent(currentClipFilename);
+  if (currentClipFilename) {
+    window.location.href = '/api/download-file/clip/' + encodeURIComponent(currentClipFilename);
+  }
+}
+
+function copySubtitle() {
+  const textarea = document.getElementById('subtitle-text');
+  textarea.select();
+  document.execCommand('copy');
+  const btn = document.querySelector('.copy-btn');
+  const orig = btn.textContent;
+  btn.textContent = '✓ Copied!';
+  setTimeout(() => { btn.textContent = orig; }, 1500);
 }
 
 document.getElementById('url-input').addEventListener('keydown', e => {
@@ -394,6 +541,9 @@ class CutRequest(BaseModel):
     ts_from: str
     ts_to: str
 
+class SubtitleOnlyRequest(BaseModel):
+    url: str
+
 # ---------------------------------------------------------------------------
 # ROUTES
 # ---------------------------------------------------------------------------
@@ -406,6 +556,13 @@ async def api_download(req: DownloadRequest):
     job_id = str(uuid.uuid4())
     job_set(job_id, "running")
     threading.Thread(target=download_worker, args=(job_id, req.url), daemon=True).start()
+    return {"job_id": job_id}
+
+@app.post("/api/subtitles-only")
+async def api_subtitles_only(req: SubtitleOnlyRequest):
+    job_id = str(uuid.uuid4())
+    job_set(job_id, "running")
+    threading.Thread(target=subtitle_only_worker, args=(job_id, req.url), daemon=True).start()
     return {"job_id": job_id}
 
 @app.post("/api/cut")
