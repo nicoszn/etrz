@@ -289,7 +289,7 @@ def subtitle_segments_worker(job_id: str, url: str):
         job_set(job_id, "error", error=str(ex))
 
 
-def cut_worker(job_id: str, source_filename: str, ts_from: str, ts_to: str):
+def cut_worker(job_id: str, source_filename: str, ts_from: str, ts_to: str, mode: str = "normal"):
     try:
         if not validate_timestamp(ts_from):
             raise ValueError(
@@ -325,23 +325,31 @@ def cut_worker(job_id: str, source_filename: str, ts_from: str, ts_to: str):
 
         out_file = CLIPS / clip_name
 
-        cmd = [
-            "ffmpeg",
-            "-y",
-            "-ss",
-            ts_from,
-            "-i",
-            str(source),
-            "-t",
-            duration,
-            "-c",
-            "copy",
-            "-avoid_negative_ts",
-            "make_zero",
-            "-movflags",
-            "+faststart",
-            str(out_file)
-]
+                if mode == "9:16":
+            cmd = [
+                "ffmpeg", "-y",
+                "-ss", ts_from,
+                "-i", str(source),
+                "-t", duration,
+                "-vf", "crop=ih*9/16:ih:(iw-ih*9/16)/2:0,scale=1080:1920",
+                "-c:v", "libx264", "-profile:v", "main", "-level:v", "4.0",
+                "-c:a", "aac", "-b:a", "192k",
+                "-avoid_negative_ts", "make_zero",
+                "-movflags", "+faststart",
+                str(out_file)
+            ]
+        else:
+            cmd = [
+                "ffmpeg", "-y",
+                "-ss", ts_from,
+                "-i", str(source),
+                "-t", duration,
+                "-c", "copy",
+                "-avoid_negative_ts", "make_zero",
+                "-movflags", "+faststart",
+                str(out_file)
+            ]
+
 
         result = subprocess.run(
             cmd,
@@ -486,6 +494,15 @@ button:disabled{opacity:.35;cursor:not-allowed}
           <label class="lbl">To (HH:MM:SS.mmm)</label>
           <input type="text" id="ts-to" placeholder="00:00:30.000"/>
         </div>
+      </div>
+            <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+        <label class="lbl" style="margin:0">Output format:</label>
+        <label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer">
+          <input type="radio" name="cut-mode" value="normal" checked/> Original (stream copy)
+        </label>
+        <label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer">
+          <input type="radio" name="cut-mode" value="9:16"/> 9:16 Vertical (1080×1920)
+        </label>
       </div>
       <div class="row">
         <button id="cut-btn" onclick="startCut()" disabled>✂ Cut Clip</button>
@@ -710,7 +727,8 @@ async function startCut() {
     const res = await fetch('/api/cut', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ source_filename: currentFilename, ts_from: from, ts_to: to })
+     const cutMode = document.querySelector('input[name="cut-mode"]:checked')?.value || 'normal';
+      body: JSON.stringify({ source_filename: currentFilename, ts_from: from, ts_to: to, mode: cutMode })
     });
     const data = await res.json();
 
@@ -830,6 +848,7 @@ class CutRequest(BaseModel):
     source_filename: str
     ts_from: str
     ts_to: str
+    mode: str = "normal"  # "normal" | "9:16"
 
     @validator('ts_from', 'ts_to')
     def validate_timestamp(cls, v):
@@ -872,12 +891,12 @@ async def api_subtitles_segments(req: SubtitleOnlyRequest):
 async def api_cut(req: CutRequest):
     job_id = str(uuid.uuid4())
     job_set(job_id, "running")
-    threading.Thread(
+        threading.Thread(
         target=cut_worker,
-        args=(job_id, req.source_filename, req.ts_from, req.ts_to),
+        args=(job_id, req.source_filename, req.ts_from, req.ts_to, req.mode),
         daemon=True
     ).start()
-    return {"job_id": job_id}
+   return {"job_id": job_id}
 
 @app.get("/api/job/{job_id}")
 async def api_job(job_id: str):
