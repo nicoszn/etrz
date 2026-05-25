@@ -315,7 +315,6 @@ async function startDownload() {
     poll(data.job_id, 'dl-pb', 'dl-msg', (d) => {
       currentFilename = d.filename;
       setMsg('dl-msg', 'ok', '✓ Ready — ' + d.filename);
-
       document.getElementById('dl-title').textContent = d.title;
       document.getElementById('dl-meta').textContent  = 'Duration: ' + fmtDuration(d.duration) + '  ·  ' + d.filename;
       document.getElementById('dl-info').style.display = '';
@@ -353,17 +352,21 @@ async function startCut() {
     const data = await res.json();
 
     poll(data.job_id, 'cut-pb', 'cut-msg', (d) => {
-  currentClipFilename = d.clip_filename;
-  setMsg('cut-msg', 'ok', `✓ Clip ready — ${d.from} → ${d.to}`);
-  document.getElementById('cut-title').textContent = d.clip_filename;
-  document.getElementById('cut-info').style.display = '';
-  document.getElementById('cut-dl-btn').disabled    = false;
-  document.getElementById('cut-btn').disabled       = false;
-
-  downloadClip();
-}, () => {
-  document.getElementById('cut-btn').disabled = false;
-});
+      currentClipFilename = d.clip_filename;
+      setMsg('cut-msg', 'ok', `✓ Clip ready — ${d.from} → ${d.to}`);
+      document.getElementById('cut-title').textContent = d.clip_filename;
+      document.getElementById('cut-info').style.display = '';
+      document.getElementById('cut-dl-btn').disabled    = false;
+      document.getElementById('cut-btn').disabled       = false;
+      downloadClip(); // auto-download
+    }, () => {
+      document.getElementById('cut-btn').disabled = false;
+    });
+  } catch(e) {
+    document.getElementById('cut-btn').disabled = false;
+    setMsg('cut-msg', 'err', '✗ Request failed');
+  }
+}
 
 function downloadFull() {
   if (currentFilename) window.location.href = '/api/download-file/video/' + encodeURIComponent(currentFilename);
