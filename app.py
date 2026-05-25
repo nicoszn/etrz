@@ -105,7 +105,7 @@ def validate_timestamp(ts: str) -> bool:
         ts_to_seconds(ts)
         return True
     except:
-        return FalseFalse
+        return False
 
 def ytdlp_base() -> list:
     cmd = ["yt-dlp"]
@@ -291,43 +291,74 @@ def subtitle_segments_worker(job_id: str, url: str):
 
 def cut_worker(job_id: str, source_filename: str, ts_from: str, ts_to: str):
     try:
-        # Validate timestamps (allow optional .mmm)
         if not validate_timestamp(ts_from):
-            raise ValueError(f"Invalid start timestamp: {ts_from}. Use HH:MM:SS or HH:MM:SS.mmm")
+            raise ValueError(
+                f"Invalid start timestamp: {ts_from}. "
+                "Use HH:MM:SS or HH:MM:SS.mmm"
+            )
+
         if not validate_timestamp(ts_to):
-            raise ValueError(f"Invalid end timestamp: {ts_to}. Use HH:MM:SS or HH:MM:SS.mmm")
+            raise ValueError(
+                f"Invalid end timestamp: {ts_to}. "
+                "Use HH:MM:SS or HH:MM:SS.mmm"
+            )
 
         source = DOWNLOADS / source_filename
+
         if not source.exists():
             raise RuntimeError(f"Source file not found: {source_filename}")
 
-        # Strip milliseconds for ffmpeg compatibility
-        from_clean = _timestamp_to_seconds(ts_from)
-        to_clean   = _timestamp_to_seconds(ts_to)
-        duration = _calculate_duration(ts_from, ts_to)
+        start_seconds = _timestamp_to_seconds(ts_from)
+        end_seconds = _timestamp_to_seconds(ts_to)
 
-        clip_name = f"clip_{uuid.uuid4().hex[:8]}_{from_clean.replace(':','-')}_{to_clean.replace(':','-')}.mp4"
+        if end_seconds <= start_seconds:
+            raise ValueError("End timestamp must be greater than start timestamp")
+
+        duration = str(end_seconds - start_seconds)
+
+        safe_from = ts_from.replace(":", "-").replace(".", "_")
+        safe_to = ts_to.replace(":", "-").replace(".", "_")
+
+        clip_name = (
+            f"clip_{uuid.uuid4().hex[:8]}_{safe_from}_{safe_to}.mp4"
+        )
+
         out_file = CLIPS / clip_name
 
         cmd = [
-            "ffmpeg", "-y",
-            "-ss", ts_from,
-            "-i", str(source),
-            "-t", duration,
-            "-c", "copy",
-            "-avoid_negative_ts", "make_zero",
-            "-movflags", "+faststart",
+            "ffmpeg",
+            "-y",
+            "-ss",
+            ts_from,
+            "-i",
+            str(source),
+            "-t",
+            duration,
+            "-c",
+            "copy",
+            "-avoid_negative_ts",
+            "make_zero",
+            "-movflags",
+            "+faststart",
             str(out_file)
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=300
+        )
+
         if result.returncode != 0:
             raise RuntimeError(result.stderr.strip()[-400:])
 
         job_set(job_id, "done", {
             "clip_filename": clip_name,
-            "from": from_clean,
-            "to": to_clean,
+            "from": ts_from,
+            "to": ts_to,
         })
+
     except Exception as ex:
         job_set(job_id, "error", error=str(ex))
 
