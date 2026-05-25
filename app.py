@@ -315,8 +315,6 @@ def cut_worker(job_id: str, source_filename: str, ts_from: str, ts_to: str):
             raise ValueError("End timestamp must be greater than start timestamp")
 
         duration = str(end_seconds - start_seconds)
-        if duration <= 0:
-             raise ValueError("End timestamp must be after start timestamp")
 
         safe_from = ts_from.replace(":", "-").replace(".", "_")
         safe_to = ts_to.replace(":", "-").replace(".", "_")
