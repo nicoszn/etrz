@@ -46,17 +46,28 @@ def seconds_to_ts(s: float) -> str:
     return f"{h:02d}:{m:02d}:{sec:06.3f}"
 
 def ts_to_seconds(ts: str) -> float:
-    """Convert HH:MM:SS.mmm to seconds (for validation)."""
+    """Convert HH:MM:SS[.mmm] to seconds."""
     parts = ts.split(':')
     if len(parts) != 3:
-        raise ValueError("Timestamp must be HH:MM:SS.mmm")
+        raise ValueError("Timestamp must be HH:MM:SS[.mmm]")
     h = int(parts[0])
     m = int(parts[1])
-    s = float(parts[2])
-    return h * 3600 + m * 60 + s
+    # Split seconds part (may contain milliseconds)
+    sec_part = parts[2]
+    if '.' in sec_part:
+        s, ms = sec_part.split('.')
+        seconds = float(s) + float(ms) / 1000
+    else:
+        seconds = float(sec_part)
+    return h * 3600 + m * 60 + seconds
+
+def strip_milliseconds(ts: str) -> str:
+    """Remove milliseconds from timestamp if present. Returns HH:MM:SS."""
+    # Split at dot and take first part
+    return ts.split('.')[0]
 
 def validate_timestamp(ts: str) -> bool:
-    """Check if timestamp matches HH:MM:SS.mmm (leading zeros optional but recommended)."""
+    """Check if timestamp matches HH:MM:SS or HH:MM:SS.mmm (optional milliseconds)."""
     pattern = r'^\d{1,2}:\d{1,2}:\d{2}(?:\.\d{1,3})?$'
     if not re.match(pattern, ts):
         return False
@@ -64,7 +75,7 @@ def validate_timestamp(ts: str) -> bool:
         ts_to_seconds(ts)
         return True
     except:
-        return False
+        return FalseFalse
 
 def ytdlp_base() -> list:
     cmd = ["yt-dlp"]
@@ -247,27 +258,31 @@ def subtitle_segments_worker(job_id: str, url: str):
     except Exception as ex:
         job_set(job_id, "error", error=str(ex))
 
-# ... (all previous imports, constants, utils, workers except cut_worker remain the same)
 
 def cut_worker(job_id: str, source_filename: str, ts_from: str, ts_to: str):
     try:
+        # Validate timestamps (allow optional .mmm)
         if not validate_timestamp(ts_from):
-            raise ValueError(f"Invalid start timestamp: {ts_from}. Use HH:MM:SS.mmm")
+            raise ValueError(f"Invalid start timestamp: {ts_from}. Use HH:MM:SS or HH:MM:SS.mmm")
         if not validate_timestamp(ts_to):
-            raise ValueError(f"Invalid end timestamp: {ts_to}. Use HH:MM:SS.mmm")
+            raise ValueError(f"Invalid end timestamp: {ts_to}. Use HH:MM:SS or HH:MM:SS.mmm")
 
         source = DOWNLOADS / source_filename
         if not source.exists():
             raise RuntimeError(f"Source file not found: {source_filename}")
 
-        clip_name = f"clip_{uuid.uuid4().hex[:8]}_{ts_from.replace(':','-')}_{ts_to.replace(':','-')}.mp4"
+        # Strip milliseconds for ffmpeg compatibility
+        from_clean = strip_milliseconds(ts_from)
+        to_clean   = strip_milliseconds(ts_to)
+
+        clip_name = f"clip_{uuid.uuid4().hex[:8]}_{from_clean.replace(':','-')}_{to_clean.replace(':','-')}.mp4"
         out_file = CLIPS / clip_name
 
         cmd = [
             "ffmpeg", "-y",
-            "-ss", ts_from,
+            "-ss", from_clean,
             "-i", str(source),
-            "-to", ts_to,
+            "-to", to_clean,
             "-c:v", "libx264",
             "-preset", "fast",
             "-crf", "23",
@@ -282,13 +297,11 @@ def cut_worker(job_id: str, source_filename: str, ts_from: str, ts_to: str):
 
         job_set(job_id, "done", {
             "clip_filename": clip_name,
-            "from": ts_from,
-            "to": ts_to,
+            "from": from_clean,
+            "to": to_clean,
         })
     except Exception as ex:
         job_set(job_id, "error", error=str(ex))
-
-# ... (rest of the code unchanged)
 
 # ---------------------------------------------------------------------------
 # INLINE HTML (duration uses backend formatted string)
