@@ -353,20 +353,17 @@ async function startCut() {
     const data = await res.json();
 
     poll(data.job_id, 'cut-pb', 'cut-msg', (d) => {
-      currentClipFilename = d.clip_filename;
-      setMsg('cut-msg', 'ok', `✓ Clip ready — ${d.from} → ${d.to}`);
-      document.getElementById('cut-title').textContent = d.clip_filename;
-      document.getElementById('cut-info').style.display = '';
-      document.getElementById('cut-dl-btn').disabled    = false;
-      document.getElementById('cut-btn').disabled       = false;
-    }, () => {
-      document.getElementById('cut-btn').disabled = false;
-    });
-  } catch(e) {
-    document.getElementById('cut-btn').disabled = false;
-    setMsg('cut-msg', 'err', '✗ Request failed');
-  }
-}
+  currentClipFilename = d.clip_filename;
+  setMsg('cut-msg', 'ok', `✓ Clip ready — ${d.from} → ${d.to}`);
+  document.getElementById('cut-title').textContent = d.clip_filename;
+  document.getElementById('cut-info').style.display = '';
+  document.getElementById('cut-dl-btn').disabled    = false;
+  document.getElementById('cut-btn').disabled       = false;
+
+  downloadClip();
+}, () => {
+  document.getElementById('cut-btn').disabled = false;
+});
 
 function downloadFull() {
   if (currentFilename) window.location.href = '/api/download-file/video/' + encodeURIComponent(currentFilename);
@@ -428,11 +425,21 @@ async def download_video(filename: str):
     path = DOWNLOADS / filename
     if not path.exists():
         raise HTTPException(404, "File not found")
-    return FileResponse(str(path), media_type="video/mp4", filename=filename)
+    return FileResponse(
+        str(path),
+        media_type="video/mp4",
+        filename=filename,
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{filename}"}
+    )
 
 @app.get("/api/download-file/clip/{filename}")
 async def download_clip(filename: str):
     path = CLIPS / filename
     if not path.exists():
         raise HTTPException(404, "File not found")
-    return FileResponse(str(path), media_type="video/mp4", filename=filename)
+    return FileResponse(
+        str(path),
+        media_type="video/mp4",
+        filename=filename,
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{filename}"}
+    )
