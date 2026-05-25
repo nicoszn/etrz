@@ -309,25 +309,17 @@ def cut_worker(job_id: str, source_filename: str, ts_from: str, ts_to: str, mode
 
         clip_name = f"clip_{uuid.uuid4().hex[:8]}_{safe_from}_{safe_to}.mp4"
         out_file = CLIPS / clip_name
-
+        
         if mode == "9:16":
-            # FIXED: Single-pass pipeline. No temp file needed.
-            # -threads 1 added here directly prevents the Step 2 encoding OOM crash (-9).
-            # -ss after -i ensures frame-accurate cropping without black screen stutters.
-            filter_complex = (
-                "[0:v]scale=1080:1920,boxblur=40:5[bg];"
-                "[0:v]scale=1080:-1:force_original_aspect_ratio=decrease[fg];"
-                "[bg][fg]overlay=(W-w)/2:(H-h)/2[out]"
-            )
+            # Letterbox pipeline (Fits the entire source video, adds black bars)
+            video_filter = "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black"
             cmd = [
                 "ffmpeg", "-y",
                 "-threads", "1",
                 "-i", str(source),
                 "-ss", ts_from,
                 "-t", duration,
-                "-filter_complex", filter_complex,
-                "-map", "[out]",
-                "-map", "0:a", # Map original audio track.
+                "-vf", video_filter,
                 "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
                 "-pix_fmt", "yuv420p",
                 "-c:a", "aac", "-b:a", "128k",
