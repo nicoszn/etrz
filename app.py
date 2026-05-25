@@ -247,9 +247,10 @@ def subtitle_segments_worker(job_id: str, url: str):
     except Exception as ex:
         job_set(job_id, "error", error=str(ex))
 
+# ... (all previous imports, constants, utils, workers except cut_worker remain the same)
+
 def cut_worker(job_id: str, source_filename: str, ts_from: str, ts_to: str):
     try:
-        # Validate timestamps before running ffmpeg
         if not validate_timestamp(ts_from):
             raise ValueError(f"Invalid start timestamp: {ts_from}. Use HH:MM:SS.mmm")
         if not validate_timestamp(ts_to):
@@ -267,8 +268,11 @@ def cut_worker(job_id: str, source_filename: str, ts_from: str, ts_to: str):
             "-ss", ts_from,
             "-i", str(source),
             "-to", ts_to,
-            "-c", "copy",
-            "-avoid_negative_ts", "make_zero",
+            "-c:v", "libx264",
+            "-preset", "fast",
+            "-crf", "23",
+            "-c:a", "aac",
+            "-b:a", "128k",
             "-movflags", "+faststart",
             str(out_file)
         ]
@@ -283,6 +287,8 @@ def cut_worker(job_id: str, source_filename: str, ts_from: str, ts_to: str):
         })
     except Exception as ex:
         job_set(job_id, "error", error=str(ex))
+
+# ... (rest of the code unchanged)
 
 # ---------------------------------------------------------------------------
 # INLINE HTML (duration uses backend formatted string)
