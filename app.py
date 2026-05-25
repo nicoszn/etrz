@@ -314,13 +314,21 @@ def cut_worker(job_id: str, source_filename: str, ts_from: str, ts_to: str, mode
             # FIXED: Single-pass pipeline. No temp file needed.
             # -threads 1 added here directly prevents the Step 2 encoding OOM crash (-9).
             # -ss after -i ensures frame-accurate cropping without black screen stutters.
+            filter_complex = (
+                "[0:v]scale=ih*9/16:ih:force_original_aspect_ratio=decrease,boxblur=20:5[bg];"
+                "[bg]scale=1080:1920[bg_scaled];"
+                "[0:v]scale=1080:-1[fg];"
+                "[bg_scaled][fg]overlay=(W-w)/2:(H-h)/2[out]"
+            )
             cmd = [
                 "ffmpeg", "-y",
                 "-threads", "1",
                 "-i", str(source),
                 "-ss", ts_from,
                 "-t", duration,
-                "-vf", "crop=ih*9/16:ih:(iw-ih*9/16)/2:0,scale=1080:1920",
+                "-filter_complex", filter_complex,
+                "-map", "[out]",
+                "-map", "0:a", # Map original audio track.
                 "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
                 "-pix_fmt", "yuv420p",
                 "-c:a", "aac", "-b:a", "128k",
