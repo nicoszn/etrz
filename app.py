@@ -84,13 +84,17 @@ def download_worker(job_id: str, url: str):
         meta = json.loads(meta_res.stdout.strip().splitlines()[-1])
         video_id = meta.get("id", "unknown")
         title = meta.get("title", "untitled")
-        duration = meta.get("duration", 0)
+        duration_raw = meta.get("duration", 0)
+        # Ensure duration is in seconds (yt-dlp returns seconds, but if somehow string, parse)
+        try:
+            duration = float(duration_raw)
+        except (TypeError, ValueError):
+            duration = 0
 
         safe_title = "".join(c for c in title if c.isalnum() or c in " -_").strip()[:60]
         out_file = DOWNLOADS / f"{video_id}_{safe_title}.mp4"
 
         if out_file.exists():
-            # Already have video, try to get subtitles if missing
             vtt_path = out_file.with_suffix('.en.vtt')
             sub_text = extract_plain_text_from_vtt(vtt_path) if vtt_path.exists() else ""
             file_size_mb = get_file_size_mb(out_file)
@@ -104,7 +108,7 @@ def download_worker(job_id: str, url: str):
             })
             return
 
-        # Download video with H.264/AAC (broad compatibility)
+        # Download video with H.264/AAC
         dl_cmd = ytdlp_base() + [
             "-S", "vcodec:h264,res,acodec:aac",
             "--merge-output-format", "mp4",
@@ -147,7 +151,6 @@ def download_worker(job_id: str, url: str):
 def subtitle_only_worker(job_id: str, url: str):
     """Download only plain text subtitles (no video)."""
     try:
-        # Get title
         meta_cmd = ytdlp_base() + ["--dump-json", "--no-playlist", url]
         meta_res = subprocess.run(meta_cmd, capture_output=True, text=True, timeout=60)
         if meta_res.returncode != 0:
@@ -155,7 +158,6 @@ def subtitle_only_worker(job_id: str, url: str):
         meta = json.loads(meta_res.stdout.strip().splitlines()[-1])
         title = meta.get("title", "untitled")
 
-        # Temp VTT file
         tmp_base = TEMP / f"sub_{job_id}"
         sub_cmd = ytdlp_base() + [
             "--skip-download",
@@ -181,7 +183,6 @@ def subtitle_only_worker(job_id: str, url: str):
 def subtitle_segments_worker(job_id: str, url: str):
     """Extract structured subtitle segments with start/end timestamps using yt-dlp's JSON3."""
     try:
-        # Get video ID and title for display
         meta_cmd = ytdlp_base() + ["--dump-json", "--no-playlist", url]
         meta_res = subprocess.run(meta_cmd, capture_output=True, text=True, timeout=60)
         if meta_res.returncode != 0:
@@ -189,7 +190,6 @@ def subtitle_segments_worker(job_id: str, url: str):
         meta = json.loads(meta_res.stdout.strip().splitlines()[-1])
         title = meta.get("title", "untitled")
 
-        # Download JSON3 subtitles
         tmp_base = TEMP / f"segments_{job_id}"
         sub_cmd = ytdlp_base() + [
             "--skip-download",
@@ -267,7 +267,7 @@ def cut_worker(job_id: str, source_filename: str, ts_from: str, ts_to: str):
         job_set(job_id, "error", error=str(ex))
 
 # ---------------------------------------------------------------------------
-# INLINE HTML (with Downloads Library and file size)
+# INLINE HTML (with delete button and fixed duration formatting)
 # ---------------------------------------------------------------------------
 HTML = r"""<!DOCTYPE html>
 <html lang="en">
@@ -281,6 +281,7 @@ HTML = r"""<!DOCTYPE html>
   --bg:#0f0f11;--surface:#1a1a1f;--surface2:#222228;
   --border:#2e2e38;--accent:#7c5cfc;--accent2:#fc5c7d;
   --text:#e8e8f0;--muted:#6b6b80;--ok:#4caf88;--err:#fc5c5c;
+  --delete:#e06c75;
 }
 body{background:var(--bg);color:var(--text);font-family:'SF Mono','Fira Code','Consolas',monospace;font-size:13px;min-height:100vh}
 header{padding:16px 32px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:14px;flex-wrap:wrap}
@@ -288,9 +289,9 @@ header h1{font-size:17px;font-weight:700;letter-spacing:.06em;background:linear-
 .badge{font-size:10px;color:var(--muted);border:1px solid var(--border);padding:2px 8px;border-radius:4px}
 .main{max-width:1200px;margin:40px auto;padding:0 24px;display:flex;flex-direction:column;gap:28px}
 .card{background:var(--surface);border:1px solid var(--border);border-radius:12px;overflow:hidden}
-.card-header{padding:16px 20px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px}
+.card-header{padding:16px 20px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px;flex-wrap:wrap}
 .card-header .num{width:24px;height:24px;border-radius:6px;background:var(--accent);color:#fff;font-size:11px;font-weight:700;display:flex;align-items:center;justify-content:center}
-.card-header .title{font-size:13px;font-weight:600}
+.card-header .title{font-size:13px;font-weight:600;flex:1}
 .card-body{padding:20px;display:flex;flex-direction:column;gap:14px}
 label.lbl{font-size:10px;color:var(--muted);letter-spacing:.12em;text-transform:uppercase;display:block;margin-bottom:6px}
 input[type=text]{width:100%;background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:10px 13px;border-radius:8px;font-family:inherit;font-size:13px;outline:none;transition:border-color .15s}
@@ -303,6 +304,7 @@ button:active{transform:scale(.97)}
 button.sec{background:var(--surface2);border:1px solid var(--border);color:var(--text)}
 button.subtitle-btn{background:#3b3b5c;border-color:#5a5a7a}
 button.ok-btn{background:#2a6b4a}
+button.delete-btn{background:rgba(224,108,117,0.15);border:1px solid var(--delete);color:var(--delete);padding:4px 10px;font-size:10px}
 button:disabled{opacity:.35;cursor:not-allowed}
 .pw{background:var(--border);border-radius:4px;height:3px;overflow:hidden}
 .pb{height:100%;width:0%;background:linear-gradient(90deg,var(--accent),var(--accent2));border-radius:4px;transition:width .3s}
@@ -318,11 +320,12 @@ button:disabled{opacity:.35;cursor:not-allowed}
 .subtitle-box textarea{width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:10px;border-radius:6px;font-family:inherit;font-size:12px;resize:vertical}
 .copy-btn{background:var(--surface2);border:1px solid var(--border);padding:4px 10px;border-radius:6px;font-size:10px;cursor:pointer}
 .copy-btn:hover{background:var(--accent);color:#000}
-.file-list{display:flex;flex-direction:column;gap:8px;max-height:300px;overflow-y:auto}
-.file-item{background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:10px 14px;display:flex;align-items:center;justify-content:space-between}
-.file-info{flex:1;min-width:0}
+.file-list{display:flex;flex-direction:column;gap:8px;max-height:400px;overflow-y:auto}
+.file-item{background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:10px 14px;display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}
+.file-info{flex:1;min-width:150px}
 .file-name{font-size:12px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .file-meta{font-size:10px;color:var(--muted);margin-top:3px}
+.file-actions{display:flex;gap:6px}
 .refresh-btn{background:var(--surface2);border:1px solid var(--border);padding:6px 12px;font-size:11px}
 </style>
 </head>
@@ -436,11 +439,17 @@ function setPb(id, running) {
   else          { pb.classList.remove('spin'); }
 }
 
-function fmtDuration(s) {
-  if (!s) return '';
-  const h = Math.floor(s/3600), m = Math.floor((s%3600)/60), sec = Math.floor(s%60);
-  return h > 0 ? `${h}:${String(m).padStart(2,'0')}:${String(sec).padStart(2,'0')}`
-               : `${m}:${String(sec).padStart(2,'0')}`;
+function fmtDuration(seconds) {
+  // Ensure seconds is a number and positive
+  let s = parseFloat(seconds);
+  if (isNaN(s) || s <= 0) return '0:00';
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = Math.floor(s % 60);
+  if (h > 0) {
+    return `${h}:${String(m).padStart(2,'0')}:${String(sec).padStart(2,'0')}`;
+  }
+  return `${m}:${String(sec).padStart(2,'0')}`;
 }
 
 function formatBytes(mb) {
@@ -656,6 +665,29 @@ function copySubtitle() {
   setTimeout(() => { btn.textContent = orig; }, 1500);
 }
 
+async function deleteFile(filename) {
+  if (!confirm(`Delete "${filename}"?`)) return;
+  try {
+    const res = await fetch('/api/downloads/' + encodeURIComponent(filename), { method: 'DELETE' });
+    if (res.ok) {
+      loadDownloadsList();
+      // If the deleted file was the currently selected video, clear it
+      if (currentFilename === filename) {
+        currentFilename = null;
+        currentClipFilename = null;
+        document.getElementById('dl-info').style.display = 'none';
+        document.getElementById('cut-btn').disabled = true;
+      }
+      setMsg('dl-msg', 'ok', `✓ Deleted ${filename}`);
+    } else {
+      const err = await res.json();
+      setMsg('dl-msg', 'err', `✗ Delete failed: ${err.detail}`);
+    }
+  } catch(e) {
+    setMsg('dl-msg', 'err', '✗ Delete request failed');
+  }
+}
+
 async function loadDownloadsList() {
   const container = document.getElementById('downloads-list');
   container.innerHTML = '<div class="msg">Loading...</div>';
@@ -672,7 +704,10 @@ async function loadDownloadsList() {
           <div class="file-name">${escapeHtml(f.filename)}</div>
           <div class="file-meta">${f.size_mb} MB · ${f.modified}</div>
         </div>
-        <a href="/api/download-file/video/${encodeURIComponent(f.filename)}" class="sec" style="padding:5px 12px;border-radius:6px;text-decoration:none;color:var(--text);border:1px solid var(--border);">⬇ Download</a>
+        <div class="file-actions">
+          <a href="/api/download-file/video/${encodeURIComponent(f.filename)}" class="sec" style="padding:5px 12px;border-radius:6px;text-decoration:none;color:var(--text);border:1px solid var(--border);">⬇ Download</a>
+          <button class="delete-btn" onclick="deleteFile('${escapeHtml(f.filename)}')">🗑 Delete</button>
+        </div>
       </div>
     `).join('');
   } catch(e) {
@@ -693,7 +728,6 @@ document.getElementById('url-input').addEventListener('keydown', e => {
   if (e.key === 'Enter') startDownload();
 });
 
-// Initial load
 loadDownloadsList();
 </script>
 </body>
@@ -768,6 +802,18 @@ async def list_downloads():
             "modified": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
         })
     return files
+
+@app.delete("/api/downloads/{filename}")
+async def delete_download(filename: str):
+    """Delete a downloaded video file."""
+    path = DOWNLOADS / filename
+    if not path.exists():
+        raise HTTPException(404, "File not found")
+    try:
+        path.unlink()
+        return {"message": f"Deleted {filename}"}
+    except Exception as e:
+        raise HTTPException(500, f"Delete failed: {str(e)}")
 
 @app.get("/api/download-file/video/{filename}")
 async def download_video(filename: str):
