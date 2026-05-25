@@ -508,16 +508,21 @@ button:disabled{opacity:.35;cursor:not-allowed}
     </div>
   </div>
 
-  <!-- STEP 3: DOWNLOADS LIBRARY -->
+  <!-- DOWNLOADS LIBRARY -->
   <div class="card">
     <div class="card-header">
       <div class="num">3</div>
-      <div class="title">Downloads Library</div>
-      <button class="refresh-btn" onclick="loadDownloadsList()">↻ Refresh</button>
+      <div class="title">Library</div>
+      <button class="refresh-btn sec" onclick="loadDownloadsList()" style="margin-left:auto">↻ Refresh</button>
     </div>
     <div class="card-body">
-      <div id="downloads-list" class="file-list">
-        <div class="msg">Loading...</div>
+      <div style="font-size:11px;color:var(--muted);margin-bottom:4px">DOWNLOADED VIDEOS</div>
+      <div class="file-list" id="downloads-list">
+      <div class="msg">Loading...</div>
+      </div>
+      <div style="font-size:11px;color:var(--muted);margin-top:16px;margin-bottom:4px">CLIPS</div>
+      <div class="file-list" id="clips-list">
+      <div class="msg">Loading...</div>
       </div>
     </div>
   </div>
@@ -783,32 +788,72 @@ async function deleteFile(filename) {
   }
 }
 
-async function loadDownloadsList() {
-  const container = document.getElementById('downloads-list');
-  container.innerHTML = '<div class="msg">Loading...</div>';
+async function deleteClip(filename) {
+  if (!confirm(`Delete "${filename}"?`)) return;
   try {
-    const res = await fetch('/api/downloads/list');
-    const files = await res.json();
-    if (!files.length) {
-      container.innerHTML = '<div class="msg">No downloaded videos yet.</div>';
-      return;
+    const res = await fetch('/api/clips/' + encodeURIComponent(filename), { method: 'DELETE' });
+    if (res.ok) {
+      loadDownloadsList();
+    } else {
+      const err = await res.json();
+      alert(`Delete failed: ${err.detail}`);
     }
-    container.innerHTML = files.map(f => `
-      <div class="file-item">
-        <div class="file-info">
-          <div class="file-name">${escapeHtml(f.filename)}</div>
-          <div class="file-meta">${f.size_mb} MB · ${f.modified}</div>
-        </div>
-        <div class="file-actions">
-          <a href="/api/download-file/video/${encodeURIComponent(f.filename)}" class="sec" style="padding:5px 12px;border-radius:6px;text-decoration:none;color:var(--text);border:1px solid var(--border);">⬇ Download</a>
-          <button class="delete-btn" onclick="deleteFile('${escapeHtml(f.filename)}')">🗑 Delete</button>
-        </div>
-      </div>
-    `).join('');
   } catch(e) {
-    container.innerHTML = '<div class="msg err">Failed to load downloads list.</div>';
+    alert('Delete request failed');
   }
 }
+
+
+async function loadDownloadsList() {
+  const videoContainer = document.getElementById('downloads-list');
+  const clipContainer  = document.getElementById('clips-list');
+  videoContainer.innerHTML = '<div class="msg">Loading...</div>';
+  clipContainer.innerHTML  = '<div class="msg">Loading...</div>';
+  try {
+    const res  = await fetch('/api/downloads/list');
+    const data = await res.json();
+
+    // Videos
+    if (!data.videos.length) {
+      videoContainer.innerHTML = '<div class="msg">No downloaded videos yet.</div>';
+    } else {
+      videoContainer.innerHTML = data.videos.map(f => `
+        <div class="file-item">
+          <div class="file-info">
+            <div class="file-name">${escapeHtml(f.filename)}</div>
+            <div class="file-meta">${f.size_mb} MB · ${f.modified}</div>
+          </div>
+          <div class="file-actions">
+            <a href="/api/download-file/video/${encodeURIComponent(f.filename)}" class="sec" style="padding:5px 12px;border-radius:6px;text-decoration:none;color:var(--text);border:1px solid var(--border);">⬇ Download</a>
+            <button class="delete-btn" onclick="deleteFile('${escapeHtml(f.filename)}')">🗑 Delete</button>
+          </div>
+        </div>
+      `).join('');
+    }
+
+    // Clips
+    if (!data.clips.length) {
+      clipContainer.innerHTML = '<div class="msg">No clips yet.</div>';
+    } else {
+      clipContainer.innerHTML = data.clips.map(f => `
+        <div class="file-item">
+          <div class="file-info">
+            <div class="file-name">${escapeHtml(f.filename)}</div>
+            <div class="file-meta">${f.size_mb} MB · ${f.modified}</div>
+          </div>
+          <div class="file-actions">
+            <a href="/api/download-file/clip/${encodeURIComponent(f.filename)}" class="sec" style="padding:5px 12px;border-radius:6px;text-decoration:none;color:var(--text);border:1px solid var(--border);">⬇ Download</a>
+            <button class="delete-btn" onclick="deleteClip('${escapeHtml(f.filename)}')">🗑 Delete</button>
+          </div>
+        </div>
+      `).join('');
+    }
+  } catch(e) {
+    videoContainer.innerHTML = '<div class="msg err">Failed to load.</div>';
+    clipContainer.innerHTML  = '<div class="msg err">Failed to load.</div>';
+  }
+}
+
 
 function escapeHtml(str) {
   return str.replace(/[&<>]/g, function(m) {
@@ -894,15 +939,36 @@ async def api_job(job_id: str):
 
 @app.get("/api/downloads/list")
 async def list_downloads():
-    files = []
+    videos = []
     for f in sorted(DOWNLOADS.glob("*.mp4"), key=lambda p: p.stat().st_mtime, reverse=True):
         stat = f.stat()
-        files.append({
+        videos.append({
             "filename": f.name,
             "size_mb": round(stat.st_size / (1024 * 1024), 2),
             "modified": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
         })
-    return files
+
+    clips = []
+    for f in sorted(CLIPS.glob("*.mp4"), key=lambda p: p.stat().st_mtime, reverse=True):
+        stat = f.stat()
+        clips.append({
+            "filename": f.name,
+            "size_mb": round(stat.st_size / (1024 * 1024), 2),
+            "modified": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+        })
+
+    return {"videos": videos, "clips": clips}
+    
+@app.delete("/api/clips/{filename}")
+async def delete_clip(filename: str):
+    path = CLIPS / filename
+    if not path.exists():
+        raise HTTPException(404, "File not found")
+    try:
+        path.unlink()
+        return {"message": f"Deleted {filename}"}
+    except Exception as e:
+        raise HTTPException(500, f"Delete failed: {str(e)}")
 
 @app.delete("/api/downloads/{filename}")
 async def delete_download(filename: str):
