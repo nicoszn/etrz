@@ -454,9 +454,6 @@ button:disabled{opacity:.35;cursor:not-allowed}
 
 .subtitle-box{background:var(--surface2);border:1px solid var(--border);border-radius:8px;margin-top:12px;padding:12px;position:relative}
 .subtitle-box .lbl{font-size:10px;margin-bottom:6px;display:flex;justify-content:space-between;align-items:center}
-.subtitle-view-toggle{display:flex;gap:8px;margin-bottom:8px}
-.subtitle-view-toggle button{background:var(--surface);border:1px solid var(--border);padding:5px 12px;font-size:10px}
-.subtitle-view-toggle button.active{background:var(--accent);border-color:var(--accent);color:#fff}
 .subtitle-box textarea{width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:10px;border-radius:6px;font-family:inherit;font-size:12px;resize:vertical}
 .copy-btn{background:var(--surface2);border:1px solid var(--border);padding:4px 10px;border-radius:6px;font-size:10px;cursor:pointer}
 .copy-btn:hover{background:var(--accent);color:#000}
@@ -478,7 +475,7 @@ button:disabled{opacity:.35;cursor:not-allowed}
 
 <div class="main">
 
-  <!-- CARD 1: VIDEO SOURCE -->
+  <!-- CARD 1: VIDEO SOURCE (with Check button) -->
   <div class="card">
     <div class="card-header">
       <div class="num">1</div>
@@ -518,17 +515,13 @@ button:disabled{opacity:.35;cursor:not-allowed}
       <div class="pw"><div class="pb" id="dl-pb"></div></div>
       <div class="msg" id="dl-msg"></div>
 
-      <!-- Subtitle box with toggle view -->
+      <!-- Subtitle box (shown after download or subtitles only) -->
       <div id="subtitle-area" style="display:none" class="subtitle-box">
         <div class="lbl">📝 Transcript (English)
           <div style="display: flex; gap: 8px;">
             <button class="copy-btn" onclick="copyTranscript()">Copy Text</button>
             <button class="copy-btn" onclick="copySegments()">Copy Segments (JSON)</button>
           </div>
-        </div>
-        <div class="subtitle-view-toggle">
-          <button id="toggle-transcript-btn" class="active" onclick="setSubtitleView('text')">📄 Transcript</button>
-          <button id="toggle-json-btn" onclick="setSubtitleView('json')">📊 JSON Segments</button>
         </div>
         <textarea id="subtitle-text" rows="6" readonly placeholder="Subtitle text will appear here..."></textarea>
       </div>
@@ -611,14 +604,15 @@ let state = {
   subtitleSegments: [],
   checkData: null,
 };
-let subtitleViewMode = 'text'; // 'text' or 'json'
 
 // ── Robust clipboard copy (works on iOS and all browsers) ─────────────────
 async function copyToClipboard(text, successMsg = '✓ Copied to clipboard') {
   try {
+    // Modern async clipboard API
     await navigator.clipboard.writeText(text);
     setMsg('dl-msg', 'ok', successMsg);
   } catch (err) {
+    // Fallback for older browsers / iOS web views
     const textarea = document.createElement('textarea');
     textarea.value = text;
     textarea.style.position = 'fixed';
@@ -629,32 +623,6 @@ async function copyToClipboard(text, successMsg = '✓ Copied to clipboard') {
     document.body.removeChild(textarea);
     setMsg('dl-msg', 'ok', successMsg);
   }
-}
-
-// ── Update textarea based on current view mode ────────────────────────────
-function updateSubtitleDisplay() {
-  const textarea = document.getElementById('subtitle-text');
-  if (subtitleViewMode === 'text') {
-    textarea.value = state.subtitleText || '(No transcript available)';
-  } else {
-    const jsonStr = JSON.stringify(state.subtitleSegments, null, 2);
-    textarea.value = jsonStr || '(No segments available)';
-  }
-}
-
-function setSubtitleView(mode) {
-  subtitleViewMode = mode;
-  // Update button active states
-  const btnText = document.getElementById('toggle-transcript-btn');
-  const btnJson = document.getElementById('toggle-json-btn');
-  if (mode === 'text') {
-    btnText.classList.add('active');
-    btnJson.classList.remove('active');
-  } else {
-    btnJson.classList.add('active');
-    btnText.classList.remove('active');
-  }
-  updateSubtitleDisplay();
 }
 
 // ── Helpers (unchanged) ────────────────────────────────────────────────────
@@ -786,8 +754,7 @@ async function startDownload() {
       document.getElementById('cut-hint').textContent = 'Ready: ' + d.filename;
       if (state.subtitleText) {
         document.getElementById('subtitle-area').style.display = '';
-        // Reset view to transcript when new subtitle data arrives
-        setSubtitleView('text');
+        document.getElementById('subtitle-text').value = state.subtitleText;
       }
       loadDownloadsList();
     }, () => {
@@ -816,12 +783,12 @@ async function fetchSubtitlesOnly() {
       state.subtitleText = d.subtitle_text || '';
       setMsg('dl-msg', 'ok', `✓ Subtitles ready: ${d.title}`);
       document.getElementById('subtitle-area').style.display = '';
-      setSubtitleView('text');
+      document.getElementById('subtitle-text').value = state.subtitleText || '(none found)';
     });
   } catch(e) { setMsg('dl-msg', 'err', '✗ Request failed'); }
 }
 
-// ── Transcript copy (from stored text) ─────────────────────────────────────
+// ── Transcript copy (uses stored text) ─────────────────────────────────────
 function copyTranscript() {
   if (state.subtitleText) {
     copyToClipboard(state.subtitleText, '✓ Transcript copied');
@@ -830,8 +797,9 @@ function copyTranscript() {
   }
 }
 
-// ── Segments copy (fetch once, then copy from state) ──────────────────────
+// ── Segments copy (fetch once, then reuse) ─────────────────────────────────
 async function copySegments() {
+  // If segments already stored, copy immediately
   if (state.subtitleSegments.length > 0) {
     const jsonStr = JSON.stringify(state.subtitleSegments, null, 2);
     copyToClipboard(jsonStr, `✓ ${state.subtitleSegments.length} segments copied`);
@@ -853,10 +821,8 @@ async function copySegments() {
       state.subtitleSegments = d.segments || [];
       const jsonStr = JSON.stringify(state.subtitleSegments, null, 2);
       copyToClipboard(jsonStr, `✓ ${state.subtitleSegments.length} segments copied`);
-      // If user is currently viewing JSON, update the display
-      if (subtitleViewMode === 'json') {
-        updateSubtitleDisplay();
-      }
+      // Also display the JSON in the textarea for reference
+      document.getElementById('subtitle-text').value = jsonStr;
     });
   } catch(e) {
     setMsg('dl-msg', 'err', '✗ Request failed');
@@ -908,7 +874,7 @@ function downloadClip() {
     window.location.href = '/api/download-file/clip/' + encodeURIComponent(state.clipFilename);
 }
 
-// ── Library interactions (unchanged) ───────────────────────────────────────
+// ── Library interactions ───────────────────────────────────────────────────
 function selectVideo(filename) {
   state.filename = filename;
   document.getElementById('cut-btn').disabled = false;
