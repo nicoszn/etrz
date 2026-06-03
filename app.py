@@ -148,7 +148,7 @@ def check_worker(job_id: str, url: str):
 
 def download_worker(job_id: str, url: str, video_id: str, title: str,
                     duration_sec: float, duration_str: str):
-    """Full download — called only after check confirms file doesn't exist."""
+    """Full download â called only after check confirms file doesn't exist."""
     try:
         safe_title = "".join(c for c in title if c.isalnum() or c in " -_").strip()[:60]
         out_file   = DOWNLOADS / f"{video_id}_{safe_title}.mp4"
@@ -296,7 +296,7 @@ def cut_worker(job_id: str, source_filename: str, ts_from: str, ts_to: str,
         out_file  = CLIPS / clip_name
 
         if mode == "9:16":
-            # Step 1: fast stream-copy cut to temp — minimal memory
+            # Step 1: fast stream-copy cut to temp â minimal memory
             temp_file = TEMP / f"tmp_{uuid.uuid4().hex[:8]}.mp4"
             cut_cmd   = [
                 "ffmpeg", "-y",
@@ -458,26 +458,12 @@ textarea.sub-ta{width:100%;background:var(--surface2);border:1px solid var(--bor
 .fitem-dl:hover{background:var(--accent);color:#fff}
 .hint{font-size:11px;color:var(--muted);line-height:1.6}
 .sep{height:1px;background:var(--border)}
-
-@media (max-width:1024px){
-.layout{grid-template-columns:1fr}
-.col-right{order:-1}
-}
-@media (max-width:768px){
-.layout{padding:0 12px;gap:12px;margin:12px auto}
-.row,.ts-grid{display:flex;flex-direction:column}
-.vinfo{flex-direction:column}
-.vinfo-thumb{width:100%;height:auto;aspect-ratio:16/9}
-.card-bd{padding:14px}
-.file-list{max-height:none}
-}
-
 </style>
 </head>
 <body>
 <header>
-  <h1>⬡ CLIPFORGE</h1>
-  <span class="badge">yt-dlp · FFmpeg · Subtitles</span>
+  <h1>â¬¡ CLIPFORGE</h1>
+  <span class="badge">yt-dlp Â· FFmpeg Â· Subtitles</span>
 </header>
 
 <div class="layout">
@@ -502,7 +488,7 @@ textarea.sub-ta{width:100%;background:var(--surface2);border:1px solid var(--bor
 
       <!-- Already exists banner -->
       <div class="exists-banner" id="exists-banner">
-        <span>✓ Already downloaded</span>
+        <span>â Already downloaded</span>
         <button class="sec" onclick="useExisting()">Use This Video</button>
         <button class="warn-btn" onclick="forceDownload()">Re-download</button>
       </div>
@@ -514,8 +500,8 @@ textarea.sub-ta{width:100%;background:var(--surface2);border:1px solid var(--bor
           <div class="vinfo-title" id="vinfo-title"></div>
           <div class="vinfo-meta" id="vinfo-meta"></div>
           <div class="vinfo-actions">
-            <button id="dl-btn" onclick="startDownload()" style="display:none">⬇ Download Video</button>
-            <button class="warn-btn" onclick="fetchSubtitlesOnly()">📝 Subtitles Only</button>
+            <button id="dl-btn" onclick="startDownload()" style="display:none">â¬ Download Video</button>
+            <button class="warn-btn" onclick="fetchSubtitlesOnly()">ð Subtitles Only</button>
           </div>
         </div>
       </div>
@@ -526,14 +512,13 @@ textarea.sub-ta{width:100%;background:var(--surface2);border:1px solid var(--bor
       <!-- Subtitle accordion -->
       <div class="sub-accordion" id="sub-accordion" style="display:none">
         <button class="sub-toggle" id="sub-toggle" onclick="toggleSub()">
-          <span>📝 Transcript (English)</span>
-          <span class="arrow">▼</span>
+          <span>ð Transcript (English)</span>
+          <span class="arrow">â¼</span>
         </button>
         <div class="sub-body" id="sub-body">
           <div class="sub-actions">
-            <button class="sub-copy-btn" onclick="showTranscriptText()">Transcript</button>
-            <button class="sub-copy-btn" onclick="showTranscriptJson()">JSON</button>
-            <button class="sub-copy-btn" onclick="copyCurrentSubtitleView()">Copy Current View</button>
+            <button class="sub-copy-btn" onclick="copySubText()">Copy Text</button>
+            <button class="sub-copy-btn" onclick="fetchAndCopySegments()">Copy Segments JSON</button>
           </div>
           <textarea class="sub-ta" id="subtitle-text" rows="7" readonly></textarea>
         </div>
@@ -563,10 +548,10 @@ textarea.sub-ta{width:100%;background:var(--surface2);border:1px solid var(--bor
         <label class="lbl">Output Format</label>
         <div class="mode-row">
           <label><input type="radio" name="cut-mode" value="normal" checked/> Original (stream copy, instant)</label>
-          <label><input type="radio" name="cut-mode" value="9:16"/> 9:16 Vertical (1080×1920, letterbox)</label>
+          <label><input type="radio" name="cut-mode" value="9:16"/> 9:16 Vertical (1080Ã1920, letterbox)</label>
         </div>
       </div>
-      <button id="cut-btn" onclick="startCut()" disabled>✂ Cut Clip</button>
+      <button id="cut-btn" onclick="startCut()" disabled>â Cut Clip</button>
       <div class="pw"><div class="pb" id="cut-pb"></div></div>
       <div class="msg" id="cut-msg"></div>
       <div class="clip-result" id="clip-result">
@@ -574,7 +559,7 @@ textarea.sub-ta{width:100%;background:var(--surface2);border:1px solid var(--bor
           <div class="cr-name" id="cr-name"></div>
           <div class="cr-meta" id="cr-meta"></div>
         </div>
-        <button class="ok-btn" id="cut-dl-btn" onclick="downloadClip()">⬇ Download</button>
+        <button class="ok-btn" id="cut-dl-btn" onclick="downloadClip()">â¬ Download</button>
       </div>
     </div>
   </div>
@@ -587,14 +572,14 @@ textarea.sub-ta{width:100%;background:var(--surface2);border:1px solid var(--bor
     <div class="card-hd">
       <div class="num">3</div>
       <div class="ttl">Library</div>
-      <button class="sec" onclick="loadLibrary()" style="margin-left:auto;padding:5px 10px;font-size:11px">↻</button>
+      <button class="sec" onclick="loadLibrary()" style="margin-left:auto;padding:5px 10px;font-size:11px">â»</button>
     </div>
     <div class="card-bd">
       <div class="lib-section-label">Downloaded Videos</div>
-      <div class="file-list" id="videos-list"><div class="msg">Loading…</div></div>
+      <div class="file-list" id="videos-list"><div class="msg">Loadingâ¦</div></div>
       <div class="sep"></div>
       <div class="lib-section-label">Clips</div>
-      <div class="file-list" id="clips-list"><div class="msg">Loading…</div></div>
+      <div class="file-list" id="clips-list"><div class="msg">Loadingâ¦</div></div>
     </div>
   </div>
 
@@ -602,7 +587,7 @@ textarea.sub-ta{width:100%;background:var(--surface2);border:1px solid var(--bor
 </div>
 
 <script>
-// ── State ──────────────────────────────────────────────────────────────────
+// ââ State ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 let state = {
   videoId: null,
   title: null,
@@ -612,12 +597,10 @@ let state = {
   filename: null,        // active filename for cutting
   clipFilename: null,
   subtitleText: '',
-  subtitleSegments: [],
-  subtitleMode: 'text',
   checkData: null,       // raw data from last check
 };
 
-// ── Helpers ────────────────────────────────────────────────────────────────
+// ââ Helpers ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 function setMsg(id, cls, txt) {
   const el = document.getElementById(id);
   el.className = 'msg' + (cls ? ' ' + cls : '');
@@ -643,27 +626,27 @@ function poll(jid, pbId, msgId, onDone, onFail) {
       } else if (d.state === 'error') {
         clearInterval(iv); setPb(pbId, false);
         document.getElementById(pbId).style.width = '0%';
-        setMsg(msgId, 'err', '✗ ' + (d.error || 'error'));
+        setMsg(msgId, 'err', 'â ' + (d.error || 'error'));
         if (onFail) onFail();
       }
     } catch(e) {
       clearInterval(iv); setPb(pbId, false);
-      setMsg(msgId, 'err', '✗ Network error');
+      setMsg(msgId, 'err', 'â Network error');
     }
   }, 900);
 }
 
-// ── Show video info panel ──────────────────────────────────────────────────
+// ââ Show video info panel ââââââââââââââââââââââââââââââââââââââââââââââââââ
 function showVinfo(data, showDlBtn) {
   document.getElementById('vinfo-thumb').src   = data.thumbnail || '';
   document.getElementById('vinfo-title').textContent = data.title || '';
   document.getElementById('vinfo-meta').textContent  =
-    'Duration: ' + (data.duration_str || '') + (data.size_mb ? '  ·  ' + data.size_mb + ' MB' : '');
+    'Duration: ' + (data.duration_str || '') + (data.size_mb ? '  Â·  ' + data.size_mb + ' MB' : '');
   document.getElementById('vinfo').classList.add('show');
   document.getElementById('dl-btn').style.display = showDlBtn ? '' : 'none';
 }
 
-// ── STEP 1a: CHECK ─────────────────────────────────────────────────────────
+// ââ STEP 1a: CHECK âââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 async function startCheck() {
   const url = document.getElementById('url-input').value.trim();
   if (!url) return;
@@ -677,7 +660,7 @@ async function startCheck() {
   document.getElementById('clip-result').classList.remove('show');
   document.getElementById('dl-pb').style.width = '0%';
   document.getElementById('check-pb').style.width = '0%';
-  setMsg('check-msg', '', 'Checking…');
+  setMsg('check-msg', '', 'Checkingâ¦');
   setMsg('dl-msg', '', '');
   document.getElementById('check-btn').disabled = true;
 
@@ -695,7 +678,7 @@ async function startCheck() {
 
       if (d.exists) {
         state.filename = d.filename;
-        setMsg('check-msg', 'ok', '✓ Found in library');
+        setMsg('check-msg', 'ok', 'â Found in library');
         showVinfo({ ...d, size_mb: d.size_mb }, false);
         document.getElementById('exists-banner').classList.add('show');
       } else {
@@ -705,17 +688,17 @@ async function startCheck() {
     }, () => { document.getElementById('check-btn').disabled = false; });
   } catch(e) {
     document.getElementById('check-btn').disabled = false;
-    setMsg('check-msg', 'err', '✗ Request failed');
+    setMsg('check-msg', 'err', 'â Request failed');
   }
 }
 
-// Use existing file for cutting — no download needed
+// Use existing file for cutting â no download needed
 function useExisting() {
   document.getElementById('cut-btn').disabled = false;
   document.getElementById('cut-hint').textContent =
     'Ready: ' + (state.filename || '');
   document.getElementById('exists-banner').classList.remove('show');
-  setMsg('check-msg', 'ok', '✓ Using existing: ' + state.filename);
+  setMsg('check-msg', 'ok', 'â Using existing: ' + state.filename);
 }
 
 // Force re-download even if file exists
@@ -724,12 +707,12 @@ function forceDownload() {
   startDownload();
 }
 
-// ── STEP 1b: DOWNLOAD ──────────────────────────────────────────────────────
+// ââ STEP 1b: DOWNLOAD ââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 async function startDownload() {
-  if (!state.videoId) { setMsg('dl-msg', 'err', '✗ Check a URL first'); return; }
+  if (!state.videoId) { setMsg('dl-msg', 'err', 'â Check a URL first'); return; }
   document.getElementById('dl-btn').disabled = true;
   document.getElementById('dl-pb').style.width = '0%';
-  setMsg('dl-msg', '', 'Downloading…');
+  setMsg('dl-msg', '', 'Downloadingâ¦');
 
   try {
     const res  = await fetch('/api/download', {
@@ -746,7 +729,7 @@ async function startDownload() {
       document.getElementById('dl-btn').disabled = false;
       state.filename     = d.filename;
       state.subtitleText = d.subtitle_text || '';
-      setMsg('dl-msg', 'ok', '✓ Downloaded: ' + d.filename);
+      setMsg('dl-msg', 'ok', 'â Downloaded: ' + d.filename);
       showVinfo({ ...state, size_mb: d.size_mb }, false);
       document.getElementById('cut-btn').disabled = false;
       document.getElementById('cut-hint').textContent = 'Ready: ' + d.filename;
@@ -758,110 +741,77 @@ async function startDownload() {
     }, () => { document.getElementById('dl-btn').disabled = false; });
   } catch(e) {
     document.getElementById('dl-btn').disabled = false;
-    setMsg('dl-msg', 'err', '✗ Request failed');
+    setMsg('dl-msg', 'err', 'â Request failed');
   }
 }
 
-// ── Subtitles only ─────────────────────────────────────────────────────────
+// ââ Subtitles only âââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 async function fetchSubtitlesOnly() {
   const url = document.getElementById('url-input').value.trim();
-  if (!url) { setMsg('dl-msg', 'err', '✗ Enter a URL first'); return; }
-  setMsg('dl-msg', '', 'Fetching subtitles…');
+  if (!url) { setMsg('dl-msg', 'err', 'â Enter a URL first'); return; }
+  setMsg('dl-msg', '', 'Fetching subtitlesâ¦');
   document.getElementById('dl-pb').style.width = '0%';
   try {
     const res  = await fetch('/api/subtitles-only', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({url}) });
     const data = await res.json();
     poll(data.job_id, 'dl-pb', 'dl-msg', (d) => {
       state.subtitleText = d.subtitle_text || '';
-      setMsg('dl-msg', 'ok', '✓ Subtitles ready');
-      showTranscriptText();
+      setMsg('dl-msg', 'ok', 'â Subtitles ready');
+      document.getElementById('subtitle-text').value = state.subtitleText || '(none found)';
       document.getElementById('sub-accordion').style.display = '';
     });
-  } catch(e) { setMsg('dl-msg', 'err', '✗ Request failed'); }
-}
-
-
-async function copyToClipboard(text){
-  try{
-    await navigator.clipboard.writeText(text);
-  }catch(e){
-    const ta=document.createElement('textarea');
-    ta.value=text;
-    document.body.appendChild(ta);
-    ta.select();
-    document.execCommand('copy');
-    document.body.removeChild(ta);
-  }
+  } catch(e) { setMsg('dl-msg', 'err', 'â Request failed'); }
 }
 
 async function fetchAndCopySegments() {
-  if (state.subtitleSegments.length) {
-    showTranscriptJson();
-    await copyCurrentSubtitleView();
-    return;
-  }
-
   const url = document.getElementById('url-input').value.trim();
-  if (!url) { setMsg('dl-msg', 'err', '✗ Enter a URL'); return; }
-
-  setMsg('dl-msg', '', 'Fetching segments…');
-
+  if (!url) { setMsg('dl-msg', 'err', 'â Enter a URL'); return; }
+  setMsg('dl-msg', '', 'Fetching segmentsâ¦');
   try {
-    const res = await fetch('/api/subtitles-segments', {
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({url})
-    });
-
+    const res  = await fetch('/api/subtitles-segments', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({url}) });
     const data = await res.json();
-
-    poll(data.job_id, 'dl-pb', 'dl-msg', async (d) => {
-      state.subtitleSegments = d.segments || [];
-      showTranscriptJson();
-      await copyCurrentSubtitleView();
-      setMsg('dl-msg', 'ok', `✓ ${state.subtitleSegments.length} segments loaded`);
+    poll(data.job_id, 'dl-pb', 'dl-msg', (d) => {
+      const json = JSON.stringify(d.segments, null, 2);
+      navigator.clipboard.writeText(json);
+      document.getElementById('subtitle-text').value = json;
+      document.getElementById('sub-accordion').style.display = '';
+      // Open it
+      const body = document.getElementById('sub-body');
+      const tog  = document.getElementById('sub-toggle');
+      body.classList.add('open'); tog.classList.add('open');
+      setMsg('dl-msg', 'ok', `â ${d.segments.length} segments copied to clipboard`);
     });
-  } catch(e) {
-    setMsg('dl-msg', 'err', '✗ Request failed');
-  }
+  } catch(e) { setMsg('dl-msg', 'err', 'â Request failed'); }
 }
 
-function showTranscriptText(){
-  state.subtitleMode='text';
-  document.getElementById('subtitle-text').value=state.subtitleText || '(none found)';
+// ââ Subtitle accordion âââââââââââââââââââââââââââââââââââââââââââââââââââââ
+function toggleSub() {
+  document.getElementById('sub-body').classList.toggle('open');
+  document.getElementById('sub-toggle').classList.toggle('open');
 }
-
-function showTranscriptJson(){
-  state.subtitleMode='json';
-  document.getElementById('subtitle-text').value=JSON.stringify(state.subtitleSegments || [], null, 2);
-}
-
-async function copyCurrentSubtitleView(){
-  const ta=document.getElementById('subtitle-text');
-  await copyToClipboard(ta.value || '');
-  setMsg('dl-msg','ok','✓ Copied to clipboard');
-}
-
 function copySubText() {
-  copyCurrentSubtitleView();
+  const ta = document.getElementById('subtitle-text');
+  navigator.clipboard.writeText(ta.value).then(() => {
+    setMsg('dl-msg', 'ok', 'â Text copied to clipboard');
+  });
 }
 
-// ── STEP 2: CUT ────────────────────────────────────────────────────────────
+// ââ STEP 2: CUT ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 async function startCut() {
-  if (!state.filename) { setMsg('cut-msg', 'err', '✗ No video selected'); return; }
+  if (!state.filename) { setMsg('cut-msg', 'err', 'â No video selected'); return; }
   const from = document.getElementById('ts-from').value.trim();
   const to   = document.getElementById('ts-to').value.trim();
-  if (!from || !to) { setMsg('cut-msg', 'err', '✗ Both timestamps required'); return; }
+  if (!from || !to) { setMsg('cut-msg', 'err', 'â Both timestamps required'); return; }
   const tsRe = /^\d{1,2}:\d{1,2}:\d{2}(?:\.\d{1,3})?$/;
-  if (!tsRe.test(from)) { setMsg('cut-msg', 'err', '✗ Invalid From timestamp'); return; }
-  if (!tsRe.test(to))   { setMsg('cut-msg', 'err', '✗ Invalid To timestamp'); return; }
+  if (!tsRe.test(from)) { setMsg('cut-msg', 'err', 'â Invalid From timestamp'); return; }
+  if (!tsRe.test(to))   { setMsg('cut-msg', 'err', 'â Invalid To timestamp'); return; }
 
   const cutMode = document.querySelector('input[name="cut-mode"]:checked')?.value || 'normal';
   state.clipFilename = null;
   document.getElementById('cut-btn').disabled = true;
   document.getElementById('clip-result').classList.remove('show');
   document.getElementById('cut-pb').style.width = '0%';
-  setMsg('cut-msg', '', cutMode === '9:16' ? 'Cutting and converting 9:16…' : 'Cutting clip…');
+  setMsg('cut-msg', '', cutMode === '9:16' ? 'Cutting and converting 9:16â¦' : 'Cutting clipâ¦');
 
   try {
     const res  = await fetch('/api/cut', {
@@ -872,15 +822,15 @@ async function startCut() {
     poll(data.job_id, 'cut-pb', 'cut-msg', (d) => {
       state.clipFilename = d.clip_filename;
       document.getElementById('cut-btn').disabled = false;
-      setMsg('cut-msg', 'ok', `✓ Done — ${d.from} → ${d.to}`);
+      setMsg('cut-msg', 'ok', `â Done â ${d.from} â ${d.to}`);
       document.getElementById('cr-name').textContent = d.clip_filename;
-      document.getElementById('cr-meta').textContent = (d.size_mb || '') + (d.size_mb ? ' MB' : '') + (d.mode === '9:16' ? ' · 9:16 vertical' : '');
+      document.getElementById('cr-meta').textContent = (d.size_mb || '') + (d.size_mb ? ' MB' : '') + (d.mode === '9:16' ? ' Â· 9:16 vertical' : '');
       document.getElementById('clip-result').classList.add('show');
       loadLibrary();
     }, () => { document.getElementById('cut-btn').disabled = false; });
   } catch(e) {
     document.getElementById('cut-btn').disabled = false;
-    setMsg('cut-msg', 'err', '✗ Request failed');
+    setMsg('cut-msg', 'err', 'â Request failed');
   }
 }
 
@@ -889,7 +839,7 @@ function downloadClip() {
     window.location.href = '/api/download-file/clip/' + encodeURIComponent(state.clipFilename);
 }
 
-// ── Library: click to select video for cutting ─────────────────────────────
+// ââ Library: click to select video for cutting âââââââââââââââââââââââââââââ
 function selectVideo(filename) {
   state.filename = filename;
   document.getElementById('cut-btn').disabled = false;
@@ -940,11 +890,11 @@ async function loadLibrary() {
         <div class="fitem" data-fn="${escapeHtml(f.filename)}" onclick="selectVideo('${escapeHtml(f.filename)}')">
           <div class="fitem-info">
             <div class="fitem-name">${escapeHtml(f.filename)}</div>
-            <div class="fitem-meta">${f.size_mb} MB · ${f.modified}</div>
+            <div class="fitem-meta">${f.size_mb} MB Â· ${f.modified}</div>
           </div>
           <div class="fitem-actions" onclick="event.stopPropagation()">
-            <a class="fitem-dl" href="/api/download-file/video/${encodeURIComponent(f.filename)}" download>⬇</a>
-            <button class="del-btn" onclick="deleteVideo('${escapeHtml(f.filename)}', event)">🗑</button>
+            <a class="fitem-dl" href="/api/download-file/video/${encodeURIComponent(f.filename)}" download>â¬</a>
+            <button class="del-btn" onclick="deleteVideo('${escapeHtml(f.filename)}', event)">ð</button>
           </div>
         </div>`).join('');
       // Re-apply active state
@@ -962,11 +912,11 @@ async function loadLibrary() {
         <div class="fitem">
           <div class="fitem-info">
             <div class="fitem-name">${escapeHtml(f.filename)}</div>
-            <div class="fitem-meta">${f.size_mb} MB · ${f.modified}</div>
+            <div class="fitem-meta">${f.size_mb} MB Â· ${f.modified}</div>
           </div>
           <div class="fitem-actions">
-            <a class="fitem-dl" href="/api/download-file/clip/${encodeURIComponent(f.filename)}" download>⬇</a>
-            <button class="del-btn" onclick="deleteClip('${escapeHtml(f.filename)}', event)">🗑</button>
+            <a class="fitem-dl" href="/api/download-file/clip/${encodeURIComponent(f.filename)}" download>â¬</a>
+            <button class="del-btn" onclick="deleteClip('${escapeHtml(f.filename)}', event)">ð</button>
           </div>
         </div>`).join('');
     }
