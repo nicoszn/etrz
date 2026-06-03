@@ -310,45 +310,45 @@ def subtitle_segments_worker(job_id: str, url: str):
         job_set(job_id, "error", error=str(ex))
 
 def cut_worker(job_id: str, source_filename: str, ts_from: str, ts_to: str, mode: str = "normal"):
-    temp_file = None
     try:
         if not validate_timestamp(ts_from):
-            raise ValueError(f"Invalid start timestamp: {ts_from}. Use HH:MM:SS or HH:MM:SS.mmm")
+            raise ValueError(
+                f"Invalid start timestamp: {ts_from}. "
+                "Use HH:MM:SS or HH:MM:SS.mmm"
+            )
+
         if not validate_timestamp(ts_to):
-            raise ValueError(f"Invalid end timestamp: {ts_to}. Use HH:MM:SS or HH:MM:SS.mmm")
+            raise ValueError(
+                f"Invalid end timestamp: {ts_to}. "
+                "Use HH:MM:SS or HH:MM:SS.mmm"
+            )
 
         source = DOWNLOADS / source_filename
+
         if not source.exists():
             raise RuntimeError(f"Source file not found: {source_filename}")
 
-        start_s  = _timestamp_to_seconds(ts_from)
-        end_s    = _timestamp_to_seconds(ts_to)
-        if end_s <= start_s:
-            raise ValueError("End timestamp must be greater than start timestamp")
-        duration = str(end_s - start_s)
+        start_seconds = _timestamp_to_seconds(ts_from)
+        end_seconds = _timestamp_to_seconds(ts_to)
 
-        # Simple clip filename (from app-1)
+        if end_seconds <= start_seconds:
+            raise ValueError("End timestamp must be greater than start timestamp")
+
+        duration = str(end_seconds - start_seconds)
+
+        # Simple UUID-based filename (from app-1)
         clip_name = f"clip_{uuid.uuid4().hex[:8]}.mp4"
-        out_file  = CLIPS / clip_name
+        out_file = CLIPS / clip_name
 
         if mode == "9:16":
-            # Two‑step approach from app-1: fast copy to temp, then re-encode
-            temp_file = TEMP / f"tmp_{uuid.uuid4().hex[:8]}.mp4"
-            cut_cmd   = [
-                "ffmpeg", "-y",
-                "-ss", ts_from, "-i", str(source),
-                "-t", duration,
-                "-c", "copy", "-avoid_negative_ts", "make_zero",
-                str(temp_file)
-            ]
-            cr = subprocess.run(cut_cmd, capture_output=True, text=True, timeout=120)
-            if cr.returncode != 0:
-                raise RuntimeError(f"Cut step failed: {cr.stderr.strip()[-300:]}")
-
+            # Letterbox pipeline (Fits the entire source video, adds black bars)
             video_filter = "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black"
             cmd = [
                 "ffmpeg", "-y",
-                "-i", str(temp_file),
+                "-threads", "1",
+                "-i", str(source),
+                "-ss", ts_from,
+                "-t", duration,
                 "-vf", video_filter,
                 "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
                 "-pix_fmt", "yuv420p",
@@ -357,38 +357,40 @@ def cut_worker(job_id: str, source_filename: str, ts_from: str, ts_to: str, mode
                 str(out_file)
             ]
         else:
-            # Normal stream copy
+            # Normal stream copy mode
             cmd = [
                 "ffmpeg", "-y",
-                "-ss", ts_from, "-i", str(source),
+                "-ss", ts_from,
+                "-i", str(source),
                 "-t", duration,
-                "-c", "copy", "-avoid_negative_ts", "make_zero",
+                "-c", "copy",
+                "-avoid_negative_ts", "make_zero",
                 "-movflags", "+faststart",
                 str(out_file)
             ]
 
+        # Single execution point for both modes
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
 
         if result.returncode != 0:
             if result.returncode == -9:
-                raise RuntimeError("FFmpeg killed by OS (out of memory). Try a shorter clip or upgrade server RAM.")
+                raise RuntimeError("FFmpeg process was killed by the system (Out of Memory). Try upgrading server RAM or adding a swap file.")
             raise RuntimeError(result.stderr.strip()[-600:])
 
         if not out_file.exists() or out_file.stat().st_size < 1000:
-            raise RuntimeError(f"Output file missing or empty. stderr: {result.stderr.strip()[-300:]}")
+            raise RuntimeError(f"Output file missing or empty. FFmpeg stderr: {result.stderr.strip()[-400:]}")
 
+        # Return combined fields from app-1 (mode, size_mb) and app-2 (from, to)
         job_set(job_id, "done", {
             "clip_filename": clip_name,
             "from": ts_from,
-            "to":   ts_to,
+            "to": ts_to,
             "mode": mode,
             "size_mb": get_file_size_mb(out_file),
         })
+
     except Exception as ex:
         job_set(job_id, "error", error=str(ex))
-    finally:
-        if temp_file and temp_file.exists():
-            temp_file.unlink(missing_ok=True)
 
 # ---------------------------------------------------------------------------
 # INLINE HTML (updated with check button and full integration like app-1)
@@ -526,14 +528,14 @@ button:disabled{opacity:.35;cursor:not-allowed}
     </div>
   </div>
 
-  <!-- CARD 2: CUT CLIP -->
+  <!-- CARD 2: CUT CLIP (updated cut-info block) -->
   <div class="card">
     <div class="card-header">
       <div class="num">2</div>
       <div class="title">Cut Clip</div>
     </div>
     <div class="card-body">
-      <div class="hint">After a video is ready, set timestamps and cut a clip. Use format HH:MM:SS.mmm (e.g., 01:34:33.000).</div>
+      <div class="hint" id="cut-hint">Select or download a video first.</div>
       <div>
         <label class="lbl">From (HH:MM:SS.mmm)</label>
         <input type="text" id="ts-from" placeholder="00:00:00.000"/>
@@ -558,6 +560,8 @@ button:disabled{opacity:.35;cursor:not-allowed}
       <div class="msg" id="cut-msg"></div>
       <div class="info-box" id="cut-info" style="display:none">
         <div class="vt" id="cut-title"></div>
+        <div class="vm" id="cut-mode" style="margin-top:4px"></div>
+        <div class="vm" id="cut-size" style="margin-top:2px"></div>
         <div style="margin-top:10px">
           <button class="ok-btn" id="cut-dl-btn" onclick="downloadClip()" disabled>⬇ Download Clip</button>
         </div>
@@ -651,7 +655,6 @@ async function startCheck() {
   const url = document.getElementById('url-input').value.trim();
   if (!url) return;
 
-  // Reset state and UI
   state = { ...state, videoId: null, title: null, filename: null, clipFilename: null, checkData: null };
   document.getElementById('exists-banner').classList.remove('show');
   document.getElementById('vinfo').classList.remove('show');
@@ -698,7 +701,6 @@ function useExisting() {
   document.getElementById('cut-hint').textContent = 'Ready: ' + (state.filename || '');
   document.getElementById('exists-banner').classList.remove('show');
   setMsg('check-msg', 'ok', '✓ Using existing: ' + state.filename);
-  // Also enable download button? No, it's already downloaded.
 }
 
 function forceDownload() {
@@ -778,9 +780,10 @@ async function fetchAndCopySegments() {
     });
     const data = await res.json();
     poll(data.job_id, 'dl-pb', 'dl-msg', (d) => {
-      const jsonStr = JSON.stringify(d.segments, null, 2);
+      state.subtitleSegments = d.segments || [];
+      const jsonStr = JSON.stringify(state.subtitleSegments, null, 2);
       navigator.clipboard.writeText(jsonStr);
-      setMsg('dl-msg', 'ok', `✓ ${d.segments.length} segments copied to clipboard`);
+      setMsg('dl-msg', 'ok', `✓ ${state.subtitleSegments.length} segments copied to clipboard`);
       document.getElementById('subtitle-text').value = jsonStr;
     });
   } catch(e) { setMsg('dl-msg', 'err', '✗ Request failed'); }
@@ -796,7 +799,7 @@ function copySubtitle() {
   setTimeout(() => { btn.textContent = orig; }, 1500);
 }
 
-// ── STEP 2: CUT ────────────────────────────────────────────────────────────
+// ── STEP 2: CUT (updated to display mode and size) ─────────────────────────
 async function startCut() {
   if (!state.filename) { setMsg('cut-msg', 'err', '✗ No video selected'); return; }
   const from = document.getElementById('ts-from').value.trim();
@@ -824,6 +827,9 @@ async function startCut() {
       document.getElementById('cut-btn').disabled = false;
       setMsg('cut-msg', 'ok', `✓ Done — ${d.from} → ${d.to}`);
       document.getElementById('cut-title').textContent = d.clip_filename;
+      // Display extra fields
+      document.getElementById('cut-mode').textContent = 'Mode: ' + (d.mode === '9:16' ? '9:16 Vertical' : 'Original (stream copy)');
+      document.getElementById('cut-size').textContent = 'Size: ' + (d.size_mb ? d.size_mb.toFixed(2) + ' MB' : 'unknown');
       document.getElementById('cut-info').style.display = '';
       document.getElementById('cut-dl-btn').disabled = false;
       loadDownloadsList();
@@ -839,7 +845,7 @@ function downloadClip() {
     window.location.href = '/api/download-file/clip/' + encodeURIComponent(state.clipFilename);
 }
 
-// ── Library: click to select video for cutting ─────────────────────────────
+// ── Library interactions ───────────────────────────────────────────────────
 function selectVideo(filename) {
   state.filename = filename;
   document.getElementById('cut-btn').disabled = false;
@@ -933,16 +939,10 @@ async function loadDownloadsList() {
   }
 }
 
+// Event listeners
 document.getElementById('url-input').addEventListener('keydown', e => {
   if (e.key === 'Enter') startCheck();
 });
-document.getElementById('cut-hint') || (() => {
-  const hint = document.createElement('div');
-  hint.id = 'cut-hint';
-  hint.className = 'hint';
-  hint.textContent = 'Select or download a video first.';
-  document.querySelector('#cut-btn').parentNode.insertBefore(hint, document.getElementById('cut-btn'));
-})();
 
 loadDownloadsList();
 </script>
