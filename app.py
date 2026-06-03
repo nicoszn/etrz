@@ -475,7 +475,7 @@ button:disabled{opacity:.35;cursor:not-allowed}
 
 <div class="main">
 
-  <!-- CARD 1: VIDEO SOURCE (with Check button) -->
+  <!-- CARD 1: VIDEO SOURCE -->
   <div class="card">
     <div class="card-header">
       <div class="num">1</div>
@@ -492,14 +492,12 @@ button:disabled{opacity:.35;cursor:not-allowed}
       <div class="pw"><div class="pb" id="check-pb"></div></div>
       <div class="msg" id="check-msg"></div>
 
-      <!-- Already exists banner -->
       <div class="exists-banner" id="exists-banner">
         <span>✓ Already downloaded</span>
         <button class="sec" onclick="useExisting()">Use This Video</button>
         <button class="warn-btn" onclick="forceDownload()">Re-download</button>
       </div>
 
-      <!-- Video info -->
       <div class="vinfo" id="vinfo">
         <img class="vinfo-thumb" id="vinfo-thumb" src="" alt=""/>
         <div class="vinfo-body">
@@ -515,7 +513,6 @@ button:disabled{opacity:.35;cursor:not-allowed}
       <div class="pw"><div class="pb" id="dl-pb"></div></div>
       <div class="msg" id="dl-msg"></div>
 
-      <!-- Subtitle box (shown after download or subtitles only) -->
       <div id="subtitle-area" style="display:none" class="subtitle-box">
         <div class="lbl">📝 Transcript (English)
           <div style="display: flex; gap: 8px;">
@@ -578,13 +575,28 @@ button:disabled{opacity:.35;cursor:not-allowed}
     </div>
     <div class="card-body">
       <div style="font-size:11px;color:var(--muted);margin-bottom:4px">DOWNLOADED VIDEOS</div>
-      <div class="file-list" id="downloads-list">
-      <div class="msg">Loading...</div>
-      </div>
+      <div class="file-list" id="downloads-list"><div class="msg">Loading...</div></div>
       <div style="font-size:11px;color:var(--muted);margin-top:16px;margin-bottom:4px">CLIPS</div>
-      <div class="file-list" id="clips-list">
-      <div class="msg">Loading...</div>
+      <div class="file-list" id="clips-list"><div class="msg">Loading...</div></div>
+    </div>
+  </div>
+
+  <!-- CARD 4: EXPORT SEGMENTS WITH SCHEMA -->
+  <div class="card">
+    <div class="card-header">
+      <div class="num">4</div>
+      <div class="title">Export Segments with Schema</div>
+    </div>
+    <div class="card-body">
+      <div class="hint">
+        Merges the current segmented subtitle (if any) into the hardcoded JSON schema and copies the result.
       </div>
+      <div class="row">
+        <button id="export-schema-btn" onclick="exportSegmentsWithSchema()" disabled>
+          📋 Copy JSON (Schema + Segments)
+        </button>
+      </div>
+      <div class="msg" id="export-msg"></div>
     </div>
   </div>
 
@@ -605,14 +617,89 @@ let state = {
   checkData: null,
 };
 
+// ── Hardcoded JSON schema (transcript array is empty – will be replaced at runtime) ──
+const HARDCODED_SCHEMA = {
+  "instruction_profile": {
+    "system_instruction": "You are a short-form content strategist and clip intelligence engine. Your job is to analyze the provided transcript and produce a ranked list of clip blueprints, each conforming to the output schema defined below.",
+    "analysis_protocol": {
+      "step_1_signal_scan": "Read the full transcript. Identify moments that contain any of the following viral triggers: Counterintuitive claim ('most people think X, but actually Y'), Negative frame / fear hook ('the reason you're failing at...'), Hard number or stat ('97% of creators never do this'), Identity challenge ('if you're still doing X, you're not serious'), Curiosity gap opener ('what nobody tells you about...'), Conflict or tension beat (disagreement, pushback, revelation), Punchline / payoff moment (must have a clear buildup before it).",
+      "step_2_boundary_detection": "For each signal found, determine the natural clip window: Start: 1–3 seconds BEFORE the hook lands (capture the setup). End: 1–2 seconds AFTER the payoff resolves (let it breathe). Duration must be between 20 and 89 seconds for Shorts/TikTok compliance. If a strong signal is buried mid-sentence, walk the timestamp back to a clean sentence start.",
+      "step_3_content_type_classification": "For each clip window, classify it as one of: SLICED_FROM_SOURCE (The transcript segment alone carries the full narrative. Timestamps must be precise. hook_text_overlay must amplify, not explain. image_generation_prompt is REQUIRED to visualize the video's core concept) or SYNTHETIC_FROM_SCRATCH (The transcript segment contains a strong idea but the delivery is weak, fragmented, or context-dependent. Asset_assembly_instructions are REQUIRED — write a tighter TTS script that distills the core idea, select a voice profile, and write an image generation prompt that visualizes the concept).",
+      "step_4_hook_text_engineering": "Write the hook_text_overlay as the first thing a viewer reads on screen. Rules: Maximum 50 characters. No full stops. No filler words (just, really, very, literally). Must create immediate tension or curiosity. Do NOT summarize the clip — destabilize the viewer.",
+      "step_5_metadata_construction": "For each clip: title (Platform-native, front-load the hook, max 100 characters), description (2–3 sentences. First sentence repeats the hook with more context. Second sentence delivers the value proposition. Third is a soft CTA), hashtags (Generate 5–8 platform-ready hashtags. Format rule: You MUST include the '#' prefix, force lowercase, and merge multi-word phrases into a single string with no spaces, e.g., write '#cryptocurrency' and '#inheritancetax', never 'crypto currency' or 'inheritance tax').",
+      "step_6_scoring_and_ranking": {
+        "formula": "total_score = (hook * 0.35) + (retention * 0.25) + (novelty * 0.20) + (platform_fit * 0.10) + (clarity * 0.10)",
+        "weights": {
+          "hook_strength": 0.35,
+          "retention_arc": 0.25,
+          "novelty": 0.20,
+          "platform_fit": 0.10,
+          "standalone_clarity": 0.10
+        },
+        "rules": [
+          "Sort all clips by total_score descending.",
+          "CUTOFF RULE: Exclude any clip with total_score < 6.5.",
+          "RENDER LIMIT: Return a maximum of 5 clips. If fewer than 3 clips score above 6.5, return only those that pass."
+        ]
+      }
+    },
+    "constraints": [
+      "Never invent timestamps. Use only what exists in the provided transcript timeline.",
+      "Never hallucinate video IDs. Use the source_video_id passed to you.",
+      "If the transcript contains no segments scoring above 6.5, return clips as an empty array and set analysis_summary to explain why no viable clips were found.",
+      "Dual-platform targeting: if a clip scores ≥ 8.0, generate two entries — one for YouTube Shorts and one for TikTok — with platform-appropriate metadata variations. TikTok titles skew casual and punchy. Shorts titles skew informational and search-optimized.",
+      "The image_generation_prompt field is mandatory for all clip entries, regardless of whether they are SLICED_FROM_SOURCE or SYNTHETIC_FROM_SCRATCH.",
+      "Strict Hashtag Constraint: All items within the hashtags array must strictly begin with '#' and contain zero whitespace characters."
+    ],
+    "expected_output_format": {
+      "response_format": "json_object",
+      "enforce": "Return a single JSON object. No markdown. No preamble. No explanation.",
+      "schema": {
+        "source_video_id": "STRING — the video ID this transcript belongs to",
+        "analysis_summary": "STRING — 2 sentences max. What was the dominant content theme and which signal type appeared most?",
+        "clips": [
+          {
+            "rank": "INTEGER — 1 is highest scoring",
+            "content_generation_type": "SLICED_FROM_SOURCE | SYNTHETIC_FROM_SCRATCH",
+            "target_platform": "YouTube Shorts | TikTok",
+            "timestamp_start": "HH:MM:SS.mmm — required if SLICED_FROM_SOURCE, null if SYNTHETIC",
+            "timestamp_end": "HH:MM:SS.mmm — required if SLICED_FROM_SOURCE, null if SYNTHETIC",
+            "hook_text_overlay": "STRING — max 50 chars",
+            "score": {
+              "hook_strength": "FLOAT 1–10",
+              "retention_arc": "FLOAT 1–10",
+              "novelty": "FLOAT 1–10",
+              "platform_fit": "FLOAT 1–10",
+              "standalone_clarity": "FLOAT 1–10",
+              "total_score": "FLOAT — weighted composite"
+            },
+            "publishing_metadata": {
+              "title": "STRING — max 100 chars",
+              "description": "STRING",
+              "hashtags": ["STRING — e.g. '#cryptocurrency', '#wealthmanagement'. Mandatory '#' prefix, all lowercase, no spaces."]
+            },
+            "asset_assembly_instructions": {
+              "text_to_speech_script": "STRING — required if SYNTHETIC, null if SLICED",
+              "voice_profile": "STRING — e.g. 'authoritative male, measured pace, slight gravel' — required if SYNTHETIC, null if SLICED",
+              "image_generation_prompt": "STRING — REQUIRED FOR ALL GENERATION TYPES. Provide a descriptive visual prompt mapping to the clip concept."
+            }
+          }
+        ]
+      }
+    }
+  },
+  "data_payload": {
+    "source_video_id": "vid_abc123xyz",
+    "transcript": []   // This will be replaced with state.subtitleSegments at export time
+  }
+};
+
 // ── Robust clipboard copy (works on iOS and all browsers) ─────────────────
 async function copyToClipboard(text, successMsg = '✓ Copied to clipboard') {
   try {
-    // Modern async clipboard API
     await navigator.clipboard.writeText(text);
     setMsg('dl-msg', 'ok', successMsg);
   } catch (err) {
-    // Fallback for older browsers / iOS web views
     const textarea = document.createElement('textarea');
     textarea.value = text;
     textarea.style.position = 'fixed';
@@ -625,7 +712,7 @@ async function copyToClipboard(text, successMsg = '✓ Copied to clipboard') {
   }
 }
 
-// ── Helpers (unchanged) ────────────────────────────────────────────────────
+// ── Helpers ────────────────────────────────────────────────────────────────
 function setMsg(id, cls, txt) {
   const el = document.getElementById(id);
   el.className = 'msg' + (cls ? ' ' + cls : '');
@@ -633,8 +720,7 @@ function setMsg(id, cls, txt) {
 }
 function setPb(id, on) {
   const pb = document.getElementById(id);
-  on ? (pb.classList.add('spin'), pb.style.width='35%')
-     : (pb.classList.remove('spin'));
+  on ? (pb.classList.add('spin'), pb.style.width='35%') : (pb.classList.remove('spin'));
 }
 function escapeHtml(s) {
   return s.replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
@@ -662,10 +748,9 @@ function poll(jid, pbId, msgId, onDone, onFail) {
 }
 
 function showVinfo(data, showDlBtn) {
-  document.getElementById('vinfo-thumb').src   = data.thumbnail || '';
+  document.getElementById('vinfo-thumb').src = data.thumbnail || '';
   document.getElementById('vinfo-title').textContent = data.title || '';
-  document.getElementById('vinfo-meta').textContent  =
-    'Duration: ' + (data.duration_str || '') + (data.size_mb ? '  ·  ' + data.size_mb + ' MB' : '');
+  document.getElementById('vinfo-meta').textContent = 'Duration: ' + (data.duration_str || '') + (data.size_mb ? '  ·  ' + data.size_mb + ' MB' : '');
   document.getElementById('vinfo').classList.add('show');
   document.getElementById('dl-btn').style.display = showDlBtn ? '' : 'none';
 }
@@ -685,18 +770,21 @@ async function startCheck() {
   setMsg('check-msg', '', 'Checking…');
   setMsg('dl-msg', '', '');
   document.getElementById('check-btn').disabled = true;
+  // Disable export button until new segments are fetched
+  document.getElementById('export-schema-btn').disabled = true;
+  setMsg('export-msg', '', '');
 
   try {
-    const res  = await fetch('/api/check', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({url}) });
+    const res = await fetch('/api/check', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({url}) });
     const data = await res.json();
     poll(data.job_id, 'check-pb', 'check-msg', (d) => {
       document.getElementById('check-btn').disabled = false;
-      state.checkData   = d;
-      state.videoId     = d.video_id;
-      state.title       = d.title;
+      state.checkData = d;
+      state.videoId = d.video_id;
+      state.title = d.title;
       state.durationStr = d.duration_str;
       state.durationSec = d.duration_sec;
-      state.thumbnail   = d.thumbnail;
+      state.thumbnail = d.thumbnail;
 
       if (d.exists) {
         state.filename = d.filename;
@@ -738,13 +826,8 @@ async function startDownload() {
   setMsg('dl-msg', '', 'Downloading video and subtitles...');
 
   try {
-    const res = await fetch('/api/download', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url })
-    });
+    const res = await fetch('/api/download', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url }) });
     const data = await res.json();
-
     poll(data.job_id, 'dl-pb', 'dl-msg', (d) => {
       state.filename = d.filename;
       state.subtitleText = d.subtitle_text || '';
@@ -757,9 +840,7 @@ async function startDownload() {
         document.getElementById('subtitle-text').value = state.subtitleText;
       }
       loadDownloadsList();
-    }, () => {
-      document.getElementById('dl-btn').disabled = false;
-    });
+    }, () => { document.getElementById('dl-btn').disabled = false; });
   } catch(e) {
     document.getElementById('dl-btn').disabled = false;
     setMsg('dl-msg', 'err', '✗ Request failed');
@@ -773,11 +854,7 @@ async function fetchSubtitlesOnly() {
   setMsg('dl-msg', '', 'Fetching subtitles...');
   document.getElementById('dl-pb').style.width = '0%';
   try {
-    const res = await fetch('/api/subtitles-only', {
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({url})
-    });
+    const res = await fetch('/api/subtitles-only', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({url}) });
     const data = await res.json();
     poll(data.job_id, 'dl-pb', 'dl-msg', (d) => {
       state.subtitleText = d.subtitle_text || '';
@@ -788,7 +865,7 @@ async function fetchSubtitlesOnly() {
   } catch(e) { setMsg('dl-msg', 'err', '✗ Request failed'); }
 }
 
-// ── Transcript copy (uses stored text) ─────────────────────────────────────
+// ── Transcript copy ────────────────────────────────────────────────────────
 function copyTranscript() {
   if (state.subtitleText) {
     copyToClipboard(state.subtitleText, '✓ Transcript copied');
@@ -799,7 +876,6 @@ function copyTranscript() {
 
 // ── Segments copy (fetch once, then reuse) ─────────────────────────────────
 async function copySegments() {
-  // If segments already stored, copy immediately
   if (state.subtitleSegments.length > 0) {
     const jsonStr = JSON.stringify(state.subtitleSegments, null, 2);
     copyToClipboard(jsonStr, `✓ ${state.subtitleSegments.length} segments copied`);
@@ -811,33 +887,48 @@ async function copySegments() {
 
   setMsg('dl-msg', '', 'Fetching segments...');
   try {
-    const res = await fetch('/api/subtitles-segments', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url })
-    });
+    const res = await fetch('/api/subtitles-segments', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url }) });
     const data = await res.json();
     poll(data.job_id, 'dl-pb', 'dl-msg', (d) => {
       state.subtitleSegments = d.segments || [];
       const jsonStr = JSON.stringify(state.subtitleSegments, null, 2);
       copyToClipboard(jsonStr, `✓ ${state.subtitleSegments.length} segments copied`);
-      // Also display the JSON in the textarea for reference
       document.getElementById('subtitle-text').value = jsonStr;
+      // Enable the export button now that segments are available
+      document.getElementById('export-schema-btn').disabled = false;
     });
   } catch(e) {
     setMsg('dl-msg', 'err', '✗ Request failed');
   }
 }
 
-// ── STEP 2: CUT (unchanged) ────────────────────────────────────────────────
+// ── Export segments with schema (replaces the transcript array) ─────────────
+async function exportSegmentsWithSchema() {
+  if (!state.subtitleSegments || state.subtitleSegments.length === 0) {
+    setMsg('export-msg', 'err', '✗ No segmented subtitles available. First fetch segments using "Copy Segments (JSON)" button.');
+    return;
+  }
+  // Deep copy the schema and inject the current segments into data_payload.transcript
+  const exportObj = JSON.parse(JSON.stringify(HARDCODED_SCHEMA));
+  exportObj.data_payload.transcript = state.subtitleSegments;
+  // Also set the source_video_id to the current video ID (if available)
+  if (state.videoId) {
+    exportObj.data_payload.source_video_id = state.videoId;
+  }
+  const jsonStr = JSON.stringify(exportObj, null, 2);
+  await copyToClipboard(jsonStr, '✓ Schema + segments copied to clipboard');
+  setMsg('export-msg', 'ok', `✓ Exported ${state.subtitleSegments.length} segments with schema`);
+}
+
+// ── STEP 2: CUT ────────────────────────────────────────────────────────────
 async function startCut() {
   if (!state.filename) { setMsg('cut-msg', 'err', '✗ No video selected'); return; }
   const from = document.getElementById('ts-from').value.trim();
-  const to   = document.getElementById('ts-to').value.trim();
+  const to = document.getElementById('ts-to').value.trim();
   if (!from || !to) { setMsg('cut-msg', 'err', '✗ Both timestamps required'); return; }
   const tsRe = /^\d{1,2}:\d{1,2}:\d{2}(?:\.\d{1,3})?$/;
   if (!tsRe.test(from)) { setMsg('cut-msg', 'err', '✗ Invalid From timestamp'); return; }
-  if (!tsRe.test(to))   { setMsg('cut-msg', 'err', '✗ Invalid To timestamp'); return; }
+  if (!tsRe.test(to)) { setMsg('cut-msg', 'err', '✗ Invalid To timestamp'); return; }
 
   const cutMode = document.querySelector('input[name="cut-mode"]:checked')?.value || 'normal';
   state.clipFilename = null;
@@ -847,10 +938,7 @@ async function startCut() {
   setMsg('cut-msg', '', cutMode === '9:16' ? 'Cutting and converting 9:16…' : 'Cutting clip…');
 
   try {
-    const res = await fetch('/api/cut', {
-      method: 'POST', headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({ source_filename: state.filename, ts_from: from, ts_to: to, mode: cutMode })
-    });
+    const res = await fetch('/api/cut', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ source_filename: state.filename, ts_from: from, ts_to: to, mode: cutMode }) });
     const data = await res.json();
     poll(data.job_id, 'cut-pb', 'cut-msg', (d) => {
       state.clipFilename = d.clip_filename;
@@ -870,8 +958,7 @@ async function startCut() {
 }
 
 function downloadClip() {
-  if (state.clipFilename)
-    window.location.href = '/api/download-file/clip/' + encodeURIComponent(state.clipFilename);
+  if (state.clipFilename) window.location.href = '/api/download-file/clip/' + encodeURIComponent(state.clipFilename);
 }
 
 // ── Library interactions ───────────────────────────────────────────────────
@@ -915,13 +1002,12 @@ async function deleteClip(filename) {
 
 async function loadDownloadsList() {
   const videoContainer = document.getElementById('downloads-list');
-  const clipContainer  = document.getElementById('clips-list');
+  const clipContainer = document.getElementById('clips-list');
   videoContainer.innerHTML = '<div class="msg">Loading...</div>';
-  clipContainer.innerHTML  = '<div class="msg">Loading...</div>';
+  clipContainer.innerHTML = '<div class="msg">Loading...</div>';
   try {
-    const res  = await fetch('/api/downloads/list');
+    const res = await fetch('/api/downloads/list');
     const data = await res.json();
-
     if (!data.videos.length) {
       videoContainer.innerHTML = '<div class="msg">No downloaded videos yet.</div>';
     } else {
@@ -943,7 +1029,6 @@ async function loadDownloadsList() {
         });
       }
     }
-
     if (!data.clips.length) {
       clipContainer.innerHTML = '<div class="msg">No clips yet.</div>';
     } else {
@@ -962,14 +1047,11 @@ async function loadDownloadsList() {
     }
   } catch(e) {
     videoContainer.innerHTML = '<div class="msg err">Failed to load.</div>';
-    clipContainer.innerHTML  = '<div class="msg err">Failed to load.</div>';
+    clipContainer.innerHTML = '<div class="msg err">Failed to load.</div>';
   }
 }
 
-document.getElementById('url-input').addEventListener('keydown', e => {
-  if (e.key === 'Enter') startCheck();
-});
-
+document.getElementById('url-input').addEventListener('keydown', e => { if (e.key === 'Enter') startCheck(); });
 loadDownloadsList();
 </script>
 </body>
