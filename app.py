@@ -454,6 +454,9 @@ button:disabled{opacity:.35;cursor:not-allowed}
 
 .subtitle-box{background:var(--surface2);border:1px solid var(--border);border-radius:8px;margin-top:12px;padding:12px;position:relative}
 .subtitle-box .lbl{font-size:10px;margin-bottom:6px;display:flex;justify-content:space-between;align-items:center}
+.subtitle-view-toggle{display:flex;gap:8px;margin-bottom:8px}
+.subtitle-view-toggle button{background:var(--surface);border:1px solid var(--border);padding:5px 12px;font-size:10px}
+.subtitle-view-toggle button.active{background:var(--accent);border-color:var(--accent);color:#fff}
 .subtitle-box textarea{width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:10px;border-radius:6px;font-family:inherit;font-size:12px;resize:vertical}
 .copy-btn{background:var(--surface2);border:1px solid var(--border);padding:4px 10px;border-radius:6px;font-size:10px;cursor:pointer}
 .copy-btn:hover{background:var(--accent);color:#000}
@@ -475,7 +478,7 @@ button:disabled{opacity:.35;cursor:not-allowed}
 
 <div class="main">
 
-  <!-- CARD 1: VIDEO SOURCE (with Check button) -->
+  <!-- CARD 1: VIDEO SOURCE -->
   <div class="card">
     <div class="card-header">
       <div class="num">1</div>
@@ -515,20 +518,24 @@ button:disabled{opacity:.35;cursor:not-allowed}
       <div class="pw"><div class="pb" id="dl-pb"></div></div>
       <div class="msg" id="dl-msg"></div>
 
-      <!-- Subtitle box (shown after download or subtitles only) -->
+      <!-- Subtitle box with toggle view -->
       <div id="subtitle-area" style="display:none" class="subtitle-box">
         <div class="lbl">📝 Transcript (English)
           <div style="display: flex; gap: 8px;">
-            <button class="copy-btn" onclick="copySubtitle()">Copy Text</button>
-            <button class="copy-btn" onclick="fetchAndCopySegments()">Copy Segments (JSON)</button>
+            <button class="copy-btn" onclick="copyTranscript()">Copy Text</button>
+            <button class="copy-btn" onclick="copySegments()">Copy Segments (JSON)</button>
           </div>
+        </div>
+        <div class="subtitle-view-toggle">
+          <button id="toggle-transcript-btn" class="active" onclick="setSubtitleView('text')">📄 Transcript</button>
+          <button id="toggle-json-btn" onclick="setSubtitleView('json')">📊 JSON Segments</button>
         </div>
         <textarea id="subtitle-text" rows="6" readonly placeholder="Subtitle text will appear here..."></textarea>
       </div>
     </div>
   </div>
 
-  <!-- CARD 2: CUT CLIP (updated cut-info block) -->
+  <!-- CARD 2: CUT CLIP -->
   <div class="card">
     <div class="card-header">
       <div class="num">2</div>
@@ -598,14 +605,59 @@ let state = {
   durationStr: null,
   durationSec: null,
   thumbnail: null,
-  filename: null,        // active filename for cutting
+  filename: null,
   clipFilename: null,
   subtitleText: '',
   subtitleSegments: [],
   checkData: null,
 };
+let subtitleViewMode = 'text'; // 'text' or 'json'
 
-// ── Helpers ────────────────────────────────────────────────────────────────
+// ── Robust clipboard copy (works on iOS and all browsers) ─────────────────
+async function copyToClipboard(text, successMsg = '✓ Copied to clipboard') {
+  try {
+    await navigator.clipboard.writeText(text);
+    setMsg('dl-msg', 'ok', successMsg);
+  } catch (err) {
+    const textarea = document.createElement('textarea');
+    textarea.value = text;
+    textarea.style.position = 'fixed';
+    textarea.style.top = '-9999px';
+    document.body.appendChild(textarea);
+    textarea.select();
+    document.execCommand('copy');
+    document.body.removeChild(textarea);
+    setMsg('dl-msg', 'ok', successMsg);
+  }
+}
+
+// ── Update textarea based on current view mode ────────────────────────────
+function updateSubtitleDisplay() {
+  const textarea = document.getElementById('subtitle-text');
+  if (subtitleViewMode === 'text') {
+    textarea.value = state.subtitleText || '(No transcript available)';
+  } else {
+    const jsonStr = JSON.stringify(state.subtitleSegments, null, 2);
+    textarea.value = jsonStr || '(No segments available)';
+  }
+}
+
+function setSubtitleView(mode) {
+  subtitleViewMode = mode;
+  // Update button active states
+  const btnText = document.getElementById('toggle-transcript-btn');
+  const btnJson = document.getElementById('toggle-json-btn');
+  if (mode === 'text') {
+    btnText.classList.add('active');
+    btnJson.classList.remove('active');
+  } else {
+    btnJson.classList.add('active');
+    btnText.classList.remove('active');
+  }
+  updateSubtitleDisplay();
+}
+
+// ── Helpers (unchanged) ────────────────────────────────────────────────────
 function setMsg(id, cls, txt) {
   const el = document.getElementById(id);
   el.className = 'msg' + (cls ? ' ' + cls : '');
@@ -734,7 +786,8 @@ async function startDownload() {
       document.getElementById('cut-hint').textContent = 'Ready: ' + d.filename;
       if (state.subtitleText) {
         document.getElementById('subtitle-area').style.display = '';
-        document.getElementById('subtitle-text').value = state.subtitleText;
+        // Reset view to transcript when new subtitle data arrives
+        setSubtitleView('text');
       }
       loadDownloadsList();
     }, () => {
@@ -763,43 +816,54 @@ async function fetchSubtitlesOnly() {
       state.subtitleText = d.subtitle_text || '';
       setMsg('dl-msg', 'ok', `✓ Subtitles ready: ${d.title}`);
       document.getElementById('subtitle-area').style.display = '';
-      document.getElementById('subtitle-text').value = state.subtitleText || '(none found)';
+      setSubtitleView('text');
     });
   } catch(e) { setMsg('dl-msg', 'err', '✗ Request failed'); }
 }
 
-async function fetchAndCopySegments() {
+// ── Transcript copy (from stored text) ─────────────────────────────────────
+function copyTranscript() {
+  if (state.subtitleText) {
+    copyToClipboard(state.subtitleText, '✓ Transcript copied');
+  } else {
+    setMsg('dl-msg', 'err', '✗ No transcript available');
+  }
+}
+
+// ── Segments copy (fetch once, then copy from state) ──────────────────────
+async function copySegments() {
+  if (state.subtitleSegments.length > 0) {
+    const jsonStr = JSON.stringify(state.subtitleSegments, null, 2);
+    copyToClipboard(jsonStr, `✓ ${state.subtitleSegments.length} segments copied`);
+    return;
+  }
+
   const url = document.getElementById('url-input').value.trim();
-  if (!url) { setMsg('dl-msg', 'err', '✗ Enter a URL'); return; }
+  if (!url) { setMsg('dl-msg', 'err', '✗ Enter a URL first'); return; }
+
   setMsg('dl-msg', '', 'Fetching segments...');
   try {
     const res = await fetch('/api/subtitles-segments', {
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({url})
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url })
     });
     const data = await res.json();
     poll(data.job_id, 'dl-pb', 'dl-msg', (d) => {
       state.subtitleSegments = d.segments || [];
       const jsonStr = JSON.stringify(state.subtitleSegments, null, 2);
-      navigator.clipboard.writeText(jsonStr);
-      setMsg('dl-msg', 'ok', `✓ ${state.subtitleSegments.length} segments copied to clipboard`);
-      document.getElementById('subtitle-text').value = jsonStr;
+      copyToClipboard(jsonStr, `✓ ${state.subtitleSegments.length} segments copied`);
+      // If user is currently viewing JSON, update the display
+      if (subtitleViewMode === 'json') {
+        updateSubtitleDisplay();
+      }
     });
-  } catch(e) { setMsg('dl-msg', 'err', '✗ Request failed'); }
+  } catch(e) {
+    setMsg('dl-msg', 'err', '✗ Request failed');
+  }
 }
 
-function copySubtitle() {
-  const ta = document.getElementById('subtitle-text');
-  ta.select();
-  document.execCommand('copy');
-  const btn = document.querySelector('.copy-btn');
-  const orig = btn.textContent;
-  btn.textContent = '✓ Copied!';
-  setTimeout(() => { btn.textContent = orig; }, 1500);
-}
-
-// ── STEP 2: CUT (updated to display mode and size) ─────────────────────────
+// ── STEP 2: CUT (unchanged) ────────────────────────────────────────────────
 async function startCut() {
   if (!state.filename) { setMsg('cut-msg', 'err', '✗ No video selected'); return; }
   const from = document.getElementById('ts-from').value.trim();
@@ -827,7 +891,6 @@ async function startCut() {
       document.getElementById('cut-btn').disabled = false;
       setMsg('cut-msg', 'ok', `✓ Done — ${d.from} → ${d.to}`);
       document.getElementById('cut-title').textContent = d.clip_filename;
-      // Display extra fields
       document.getElementById('cut-mode').textContent = 'Mode: ' + (d.mode === '9:16' ? '9:16 Vertical' : 'Original (stream copy)');
       document.getElementById('cut-size').textContent = 'Size: ' + (d.size_mb ? d.size_mb.toFixed(2) + ' MB' : 'unknown');
       document.getElementById('cut-info').style.display = '';
@@ -845,14 +908,13 @@ function downloadClip() {
     window.location.href = '/api/download-file/clip/' + encodeURIComponent(state.clipFilename);
 }
 
-// ── Library interactions ───────────────────────────────────────────────────
+// ── Library interactions (unchanged) ───────────────────────────────────────
 function selectVideo(filename) {
   state.filename = filename;
   document.getElementById('cut-btn').disabled = false;
   document.getElementById('cut-hint').textContent = 'Ready: ' + filename;
   setMsg('cut-msg', '', '');
   document.getElementById('cut-info').style.display = 'none';
-  // Highlight selected
   document.querySelectorAll('#downloads-list .file-item').forEach(el => {
     el.classList.toggle('active', el.dataset.fn === filename);
   });
@@ -909,7 +971,6 @@ async function loadDownloadsList() {
           </div>
         </div>
       `).join('');
-      // Re-apply active state
       if (state.filename) {
         document.querySelectorAll('#downloads-list .file-item').forEach(el => {
           el.classList.toggle('active', el.dataset.fn === state.filename);
@@ -939,7 +1000,6 @@ async function loadDownloadsList() {
   }
 }
 
-// Event listeners
 document.getElementById('url-input').addEventListener('keydown', e => {
   if (e.key === 'Enter') startCheck();
 });
