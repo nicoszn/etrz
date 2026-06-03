@@ -38,7 +38,6 @@ def job_set(job_id: str, state: str, data: dict = None, error: str = None):
 # UTILITIES
 # ---------------------------------------------------------------------------
 def seconds_to_ts(s: float) -> str:
-    """Convert seconds to HH:MM:SS.mmm (same as original Python helper)."""
     s = round(s, 3)
     h = int(s // 3600)
     m = int((s % 3600) // 60)
@@ -54,22 +53,12 @@ def _timestamp_to_seconds(ts: str) -> float:
     seconds = float(parts[2])
     return hours * 3600 + minutes * 60 + seconds
 
-def _calculate_duration(ts_from: str, ts_to: str) -> str:
-    start_seconds = _timestamp_to_seconds(ts_from)
-    end_seconds = _timestamp_to_seconds(ts_to)
-    if end_seconds <= start_seconds:
-        raise ValueError("'to' timestamp must be greater than 'from' timestamp")
-    duration = end_seconds - start_seconds
-    return str(duration)
-
 def ts_to_seconds(ts: str) -> float:
-    """Convert HH:MM:SS[.mmm] to seconds."""
     parts = ts.split(':')
     if len(parts) != 3:
         raise ValueError("Timestamp must be HH:MM:SS[.mmm]")
     h = int(parts[0])
     m = int(parts[1])
-    # Split seconds part (may contain milliseconds)
     sec_part = parts[2]
     if '.' in sec_part:
         s, ms = sec_part.split('.')
@@ -78,13 +67,7 @@ def ts_to_seconds(ts: str) -> float:
         seconds = float(sec_part)
     return h * 3600 + m * 60 + seconds
 
-def strip_milliseconds(ts: str) -> str:
-    """Remove milliseconds from timestamp if present. Returns HH:MM:SS."""
-    # Split at dot and take first part
-    return ts.split('.')[0]
-
 def validate_timestamp(ts: str) -> bool:
-    """Check if timestamp matches HH:MM:SS or HH:MM:SS.mmm (optional milliseconds)."""
     pattern = r'^\d{1,2}:\d{1,2}:\d{2}(?:\.\d{1,3})?$'
     if not re.match(pattern, ts):
         return False
@@ -116,9 +99,60 @@ def extract_plain_text_from_vtt(vtt_path: Path) -> str:
 def get_file_size_mb(path: Path) -> float:
     return round(path.stat().st_size / (1024 * 1024), 2) if path.exists() else 0.0
 
+def find_existing_download(video_id: str):
+    """Return first mp4 in DOWNLOADS matching video_id prefix."""
+    for f in DOWNLOADS.glob(f"{video_id}_*.mp4"):
+        return f
+    return None
+
 # ---------------------------------------------------------------------------
-# WORKERS
+# WORKERS (from app-1)
 # ---------------------------------------------------------------------------
+def check_worker(job_id: str, url: str):
+    """Check metadata + whether file already exists, without downloading."""
+    try:
+        meta_cmd = ytdlp_base() + ["--dump-json", "--no-playlist", url]
+        meta_res = subprocess.run(meta_cmd, capture_output=True, text=True, timeout=60)
+        if meta_res.returncode != 0:
+            raise RuntimeError(meta_res.stderr.strip()[:400])
+
+        meta       = json.loads(meta_res.stdout.strip().splitlines()[-1])
+        video_id   = meta.get("id", "unknown")
+        title      = meta.get("title", "untitled")
+        duration_raw = meta.get("duration", 0)
+        try:
+            duration_sec = float(duration_raw)
+        except (TypeError, ValueError):
+            duration_sec = 0
+        duration_str = seconds_to_ts(duration_sec) if duration_sec > 0 else "00:00:00.000"
+        thumbnail    = meta.get("thumbnail", "")
+
+        existing = find_existing_download(video_id)
+        if existing:
+            job_set(job_id, "done", {
+                "exists": True,
+                "video_id": video_id,
+                "title": title,
+                "duration_sec": duration_sec,
+                "duration_str": duration_str,
+                "thumbnail": thumbnail,
+                "filename": existing.name,
+                "size_mb": get_file_size_mb(existing),
+            })
+        else:
+            job_set(job_id, "done", {
+                "exists": False,
+                "video_id": video_id,
+                "title": title,
+                "duration_sec": duration_sec,
+                "duration_str": duration_str,
+                "thumbnail": thumbnail,
+                "filename": None,
+                "size_mb": 0,
+            })
+    except Exception as ex:
+        job_set(job_id, "error", error=str(ex))
+
 def download_worker(job_id: str, url: str):
     try:
         meta_cmd = ytdlp_base() + ["--dump-json", "--no-playlist", url]
@@ -274,51 +308,47 @@ def subtitle_segments_worker(job_id: str, url: str):
         })
     except Exception as ex:
         job_set(job_id, "error", error=str(ex))
-        
 
 def cut_worker(job_id: str, source_filename: str, ts_from: str, ts_to: str, mode: str = "normal"):
-    temp_file = None  # Kept for compatibility, though no longer needed for 9:16 mode
+    temp_file = None
     try:
         if not validate_timestamp(ts_from):
-            raise ValueError(
-                f"Invalid start timestamp: {ts_from}. "
-                "Use HH:MM:SS or HH:MM:SS.mmm"
-            )
-
+            raise ValueError(f"Invalid start timestamp: {ts_from}. Use HH:MM:SS or HH:MM:SS.mmm")
         if not validate_timestamp(ts_to):
-            raise ValueError(
-                f"Invalid end timestamp: {ts_to}. "
-                "Use HH:MM:SS or HH:MM:SS.mmm"
-            )
+            raise ValueError(f"Invalid end timestamp: {ts_to}. Use HH:MM:SS or HH:MM:SS.mmm")
 
         source = DOWNLOADS / source_filename
-
         if not source.exists():
             raise RuntimeError(f"Source file not found: {source_filename}")
 
-        start_seconds = _timestamp_to_seconds(ts_from)
-        end_seconds = _timestamp_to_seconds(ts_to)
-
-        if end_seconds <= start_seconds:
+        start_s  = _timestamp_to_seconds(ts_from)
+        end_s    = _timestamp_to_seconds(ts_to)
+        if end_s <= start_s:
             raise ValueError("End timestamp must be greater than start timestamp")
+        duration = str(end_s - start_s)
 
-        duration = str(end_seconds - start_seconds)
+        # Simple clip filename (from app-1)
+        clip_name = f"clip_{uuid.uuid4().hex[:8]}.mp4"
+        out_file  = CLIPS / clip_name
 
-        safe_from = ts_from.replace(":", "-").replace(".", "_")
-        safe_to = ts_to.replace(":", "-").replace(".", "_")
-
-        clip_name = f"clip_{uuid.uuid4().hex[:8]}_{safe_from}_{safe_to}.mp4"
-        out_file = CLIPS / clip_name
-        
         if mode == "9:16":
-            # Letterbox pipeline (Fits the entire source video, adds black bars)
+            # Two‑step approach from app-1: fast copy to temp, then re-encode
+            temp_file = TEMP / f"tmp_{uuid.uuid4().hex[:8]}.mp4"
+            cut_cmd   = [
+                "ffmpeg", "-y",
+                "-ss", ts_from, "-i", str(source),
+                "-t", duration,
+                "-c", "copy", "-avoid_negative_ts", "make_zero",
+                str(temp_file)
+            ]
+            cr = subprocess.run(cut_cmd, capture_output=True, text=True, timeout=120)
+            if cr.returncode != 0:
+                raise RuntimeError(f"Cut step failed: {cr.stderr.strip()[-300:]}")
+
             video_filter = "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black"
             cmd = [
                 "ffmpeg", "-y",
-                "-threads", "1",
-                "-i", str(source),
-                "-ss", ts_from,
-                "-t", duration,
+                "-i", str(temp_file),
                 "-vf", video_filter,
                 "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
                 "-pix_fmt", "yuv420p",
@@ -327,49 +357,41 @@ def cut_worker(job_id: str, source_filename: str, ts_from: str, ts_to: str, mode
                 str(out_file)
             ]
         else:
-            # Normal stream copy mode
+            # Normal stream copy
             cmd = [
                 "ffmpeg", "-y",
-                "-ss", ts_from,
-                "-i", str(source),
+                "-ss", ts_from, "-i", str(source),
                 "-t", duration,
-                "-c", "copy",
-                "-avoid_negative_ts", "make_zero",
+                "-c", "copy", "-avoid_negative_ts", "make_zero",
                 "-movflags", "+faststart",
                 str(out_file)
             ]
 
-        # Single execution point for both modes
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-
-        print(f"[CUT DEBUG] returncode={result.returncode} | file_exists={out_file.exists()} | size={out_file.stat().st_size if out_file.exists() else 0}")
-        print(f"[CUT DEBUG] stderr tail: {result.stderr.strip()[-200:]}")
 
         if result.returncode != 0:
             if result.returncode == -9:
-                raise RuntimeError("FFmpeg process was killed by the system (Out of Memory). Try upgrading server RAM or adding a swap file.")
+                raise RuntimeError("FFmpeg killed by OS (out of memory). Try a shorter clip or upgrade server RAM.")
             raise RuntimeError(result.stderr.strip()[-600:])
 
         if not out_file.exists() or out_file.stat().st_size < 1000:
-            raise RuntimeError(f"Output file missing or empty. FFmpeg stderr: {result.stderr.strip()[-400:]}")
+            raise RuntimeError(f"Output file missing or empty. stderr: {result.stderr.strip()[-300:]}")
 
         job_set(job_id, "done", {
             "clip_filename": clip_name,
             "from": ts_from,
-            "to": ts_to,
+            "to":   ts_to,
+            "mode": mode,
+            "size_mb": get_file_size_mb(out_file),
         })
-
     except Exception as ex:
         job_set(job_id, "error", error=str(ex))
-
     finally:
         if temp_file and temp_file.exists():
             temp_file.unlink(missing_ok=True)
 
-
-
 # ---------------------------------------------------------------------------
-# INLINE HTML (duration uses backend formatted string)
+# INLINE HTML (updated with check button and full integration like app-1)
 # ---------------------------------------------------------------------------
 HTML = r"""<!DOCTYPE html>
 <html lang="en">
@@ -380,14 +402,13 @@ HTML = r"""<!DOCTYPE html>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 :root{
-  --bg:#0f0f11;--surface:#1a1a1f;--surface2:#222228;
+  --bg:#0f0f11;--surface:#1a1a1f;--surface2:#222228;--surface3:#1e1e24;
   --border:#2e2e38;--accent:#7c5cfc;--accent2:#fc5c7d;
-  --text:#e8e8f0;--muted:#6b6b80;--ok:#4caf88;--err:#fc5c5c;
-  --delete:#e06c75;
+  --text:#e8e8f0;--muted:#6b6b80;--ok:#4caf88;--err:#fc5c5c;--del:#e06c75;
 }
 body{background:var(--bg);color:var(--text);font-family:'SF Mono','Fira Code','Consolas',monospace;font-size:13px;min-height:100vh}
-header{padding:16px 32px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:14px;flex-wrap:wrap}
-header h1{font-size:17px;font-weight:700;letter-spacing:.06em;background:linear-gradient(135deg,var(--accent),var(--accent2));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+header{padding:15px 32px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:14px}
+header h1{font-size:16px;font-weight:700;letter-spacing:.06em;background:linear-gradient(135deg,var(--accent),var(--accent2));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
 .badge{font-size:10px;color:var(--muted);border:1px solid var(--border);padding:2px 8px;border-radius:4px}
 .main{max-width:1200px;margin:40px auto;padding:0 24px;display:flex;flex-direction:column;gap:28px}
 .card{background:var(--surface);border:1px solid var(--border);border-radius:12px;overflow:hidden}
@@ -404,9 +425,9 @@ button{background:var(--accent);color:#fff;border:none;padding:10px 20px;border-
 button:hover{opacity:.85}
 button:active{transform:scale(.97)}
 button.sec{background:var(--surface2);border:1px solid var(--border);color:var(--text)}
-button.subtitle-btn{background:#3b3b5c;border-color:#5a5a7a}
+button.warn-btn{background:#3b3b5c;color:#a0a0c0}
 button.ok-btn{background:#2a6b4a}
-button.delete-btn{background:rgba(224,108,117,0.15);border:1px solid var(--delete);color:var(--delete);padding:4px 10px;font-size:10px}
+button.delete-btn{background:rgba(224,108,117,0.15);border:1px solid var(--del);color:var(--del);padding:4px 10px;font-size:10px}
 button:disabled{opacity:.35;cursor:not-allowed}
 .pw{background:var(--border);border-radius:4px;height:3px;overflow:hidden}
 .pb{height:100%;width:0%;background:linear-gradient(90deg,var(--accent),var(--accent2));border-radius:4px;transition:width .3s}
@@ -414,14 +435,27 @@ button:disabled{opacity:.35;cursor:not-allowed}
 @keyframes spin{0%{transform:translateX(-100%)}100%{transform:translateX(380%)}}
 .msg{font-size:11px;color:var(--muted);min-height:16px;line-height:1.5}
 .msg.ok{color:var(--ok)}.msg.err{color:var(--err)}
-.info-box{background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:14px 16px;margin-top:12px}
-.info-box .vt{font-weight:600;font-size:13px;margin-bottom:4px}
-.info-box .vm{font-size:11px;color:var(--muted)}
+
+/* Video info box */
+.vinfo{background:var(--surface2);border:1px solid var(--border);border-radius:10px;padding:14px;display:none;gap:12px}
+.vinfo.show{display:flex}
+.vinfo-thumb{width:100px;height:58px;object-fit:cover;border-radius:6px;background:var(--border);flex-shrink:0}
+.vinfo-body{flex:1;min-width:0}
+.vinfo-title{font-size:12px;font-weight:600;margin-bottom:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.vinfo-meta{font-size:10px;color:var(--muted);margin-bottom:8px}
+.vinfo-actions{display:flex;gap:6px;flex-wrap:wrap}
+
+/* Exists banner */
+.exists-banner{background:rgba(76,175,136,0.1);border:1px solid rgba(76,175,136,0.3);border-radius:8px;padding:10px 14px;font-size:11px;color:var(--ok);display:none;align-items:center;gap:8px}
+.exists-banner.show{display:flex}
+.exists-banner button{padding:5px 12px;font-size:11px}
+
 .subtitle-box{background:var(--surface2);border:1px solid var(--border);border-radius:8px;margin-top:12px;padding:12px;position:relative}
 .subtitle-box .lbl{font-size:10px;margin-bottom:6px;display:flex;justify-content:space-between;align-items:center}
 .subtitle-box textarea{width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:10px;border-radius:6px;font-family:inherit;font-size:12px;resize:vertical}
 .copy-btn{background:var(--surface2);border:1px solid var(--border);padding:4px 10px;border-radius:6px;font-size:10px;cursor:pointer}
 .copy-btn:hover{background:var(--accent);color:#000}
+
 .file-list{display:flex;flex-direction:column;gap:8px;max-height:400px;overflow-y:auto}
 .file-item{background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:10px 14px;display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}
 .file-info{flex:1;min-width:150px}
@@ -439,61 +473,76 @@ button:disabled{opacity:.35;cursor:not-allowed}
 
 <div class="main">
 
-  <!-- STEP 1: DOWNLOAD VIDEO + SUBTITLES -->
+  <!-- CARD 1: VIDEO SOURCE (with Check button) -->
   <div class="card">
     <div class="card-header">
       <div class="num">1</div>
-      <div class="title">Download Video + Subtitles</div>
+      <div class="title">Video Source</div>
     </div>
     <div class="card-body">
       <div>
         <label class="lbl">YouTube URL</label>
         <div class="row">
           <input type="text" id="url-input" placeholder="https://youtube.com/watch?v=..."/>
-          <button id="dl-btn" onclick="startDownload()">Download</button>
-          <button class="subtitle-btn" onclick="fetchSubtitlesOnly()" style="background:#3b3b5c">📝 Subtitles Only</button>
+          <button id="check-btn" onclick="startCheck()">Check</button>
         </div>
       </div>
+      <div class="pw"><div class="pb" id="check-pb"></div></div>
+      <div class="msg" id="check-msg"></div>
+
+      <!-- Already exists banner -->
+      <div class="exists-banner" id="exists-banner">
+        <span>✓ Already downloaded</span>
+        <button class="sec" onclick="useExisting()">Use This Video</button>
+        <button class="warn-btn" onclick="forceDownload()">Re-download</button>
+      </div>
+
+      <!-- Video info -->
+      <div class="vinfo" id="vinfo">
+        <img class="vinfo-thumb" id="vinfo-thumb" src="" alt=""/>
+        <div class="vinfo-body">
+          <div class="vinfo-title" id="vinfo-title"></div>
+          <div class="vinfo-meta" id="vinfo-meta"></div>
+          <div class="vinfo-actions">
+            <button id="dl-btn" onclick="startDownload()" style="display:none">⬇ Download Video</button>
+            <button class="warn-btn" onclick="fetchSubtitlesOnly()">📝 Subtitles Only</button>
+          </div>
+        </div>
+      </div>
+
       <div class="pw"><div class="pb" id="dl-pb"></div></div>
       <div class="msg" id="dl-msg"></div>
-      <div class="info-box" id="dl-info" style="display:none">
-        <div class="vt" id="dl-title"></div>
-        <div class="vm" id="dl-meta"></div>
-        <div class="dl-row" style="margin-top:12px">
-          <button class="sec" id="dl-full-btn" onclick="downloadFull()" disabled>⬇ Download Video</button>
-        </div>
-        <div id="subtitle-area" style="display:none" class="subtitle-box">
-          <div class="lbl">📝 Transcript (English)
-            <div style="display: flex; gap: 8px;">
-                <button class="copy-btn" onclick="copySubtitle()">Copy Text</button>
-                <button class="copy-btn" onclick="fetchAndCopySegments()">Copy Segments (JSON)</button>
-            </div>
+
+      <!-- Subtitle box (shown after download or subtitles only) -->
+      <div id="subtitle-area" style="display:none" class="subtitle-box">
+        <div class="lbl">📝 Transcript (English)
+          <div style="display: flex; gap: 8px;">
+            <button class="copy-btn" onclick="copySubtitle()">Copy Text</button>
+            <button class="copy-btn" onclick="fetchAndCopySegments()">Copy Segments (JSON)</button>
           </div>
-          <textarea id="subtitle-text" rows="6" readonly placeholder="Subtitle text will appear here..."></textarea>
         </div>
+        <textarea id="subtitle-text" rows="6" readonly placeholder="Subtitle text will appear here..."></textarea>
       </div>
     </div>
   </div>
 
-  <!-- STEP 2: CUT CLIP -->
+  <!-- CARD 2: CUT CLIP -->
   <div class="card">
     <div class="card-header">
       <div class="num">2</div>
       <div class="title">Cut Clip</div>
     </div>
     <div class="card-body">
-      <div class="hint">After downloading a video, set timestamps and cut a clip. Use format HH:MM:SS.mmm (e.g., 01:34:33.000).</div>
-      <div class="ts-row">
-        <div>
-          <label class="lbl">From (HH:MM:SS.mmm)</label>
-          <input type="text" id="ts-from" placeholder="00:00:00.000"/>
-        </div>
-        <div>
-          <label class="lbl">To (HH:MM:SS.mmm)</label>
-          <input type="text" id="ts-to" placeholder="00:00:30.000"/>
-        </div>
+      <div class="hint">After a video is ready, set timestamps and cut a clip. Use format HH:MM:SS.mmm (e.g., 01:34:33.000).</div>
+      <div>
+        <label class="lbl">From (HH:MM:SS.mmm)</label>
+        <input type="text" id="ts-from" placeholder="00:00:00.000"/>
       </div>
-            <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+      <div>
+        <label class="lbl">To (HH:MM:SS.mmm)</label>
+        <input type="text" id="ts-to" placeholder="00:00:30.000"/>
+      </div>
+      <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
         <label class="lbl" style="margin:0">Output format:</label>
         <label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer">
           <input type="radio" name="cut-mode" value="normal" checked/> Original (stream copy)
@@ -516,7 +565,7 @@ button:disabled{opacity:.35;cursor:not-allowed}
     </div>
   </div>
 
-  <!-- DOWNLOADS LIBRARY -->
+  <!-- CARD 3: LIBRARY -->
   <div class="card">
     <div class="card-header">
       <div class="num">3</div>
@@ -538,67 +587,131 @@ button:disabled{opacity:.35;cursor:not-allowed}
 </div>
 
 <script>
-let currentFilename = null;
-let currentClipFilename = null;
-let currentSubtitle = '';
-let currentFileSize = null;
+// ── State ──────────────────────────────────────────────────────────────────
+let state = {
+  videoId: null,
+  title: null,
+  durationStr: null,
+  durationSec: null,
+  thumbnail: null,
+  filename: null,        // active filename for cutting
+  clipFilename: null,
+  subtitleText: '',
+  subtitleSegments: [],
+  checkData: null,
+};
 
+// ── Helpers ────────────────────────────────────────────────────────────────
 function setMsg(id, cls, txt) {
   const el = document.getElementById(id);
   el.className = 'msg' + (cls ? ' ' + cls : '');
   el.textContent = txt;
 }
-
-function setPb(id, running) {
+function setPb(id, on) {
   const pb = document.getElementById(id);
-  if (running) { pb.classList.add('spin'); pb.style.width = '35%'; }
-  else          { pb.classList.remove('spin'); }
+  on ? (pb.classList.add('spin'), pb.style.width='35%')
+     : (pb.classList.remove('spin'));
 }
-
-function formatBytes(mb) {
-  return mb.toFixed(2) + ' MB';
+function escapeHtml(s) {
+  return s.replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
 }
-
-function poll(jobId, pbId, msgId, onDone, onFail) {
+function poll(jid, pbId, msgId, onDone, onFail) {
   setPb(pbId, true);
   const iv = setInterval(async () => {
     try {
-      const res = await fetch('/api/job/' + jobId);
-      const d   = await res.json();
+      const d = await (await fetch('/api/job/' + jid)).json();
       if (d.state === 'done') {
-        clearInterval(iv);
-        setPb(pbId, false);
+        clearInterval(iv); setPb(pbId, false);
         document.getElementById(pbId).style.width = '100%';
         onDone(d.data);
       } else if (d.state === 'error') {
-        clearInterval(iv);
-        setPb(pbId, false);
+        clearInterval(iv); setPb(pbId, false);
         document.getElementById(pbId).style.width = '0%';
-        setMsg(msgId, 'err', '✗ ' + (d.error || 'Unknown error'));
+        setMsg(msgId, 'err', '✗ ' + (d.error || 'error'));
         if (onFail) onFail();
       }
     } catch(e) {
-      clearInterval(iv);
-      setPb(pbId, false);
+      clearInterval(iv); setPb(pbId, false);
       setMsg(msgId, 'err', '✗ Network error');
     }
   }, 900);
 }
 
-async function startDownload() {
+function showVinfo(data, showDlBtn) {
+  document.getElementById('vinfo-thumb').src   = data.thumbnail || '';
+  document.getElementById('vinfo-title').textContent = data.title || '';
+  document.getElementById('vinfo-meta').textContent  =
+    'Duration: ' + (data.duration_str || '') + (data.size_mb ? '  ·  ' + data.size_mb + ' MB' : '');
+  document.getElementById('vinfo').classList.add('show');
+  document.getElementById('dl-btn').style.display = showDlBtn ? '' : 'none';
+}
+
+// ── STEP 1a: CHECK ─────────────────────────────────────────────────────────
+async function startCheck() {
   const url = document.getElementById('url-input').value.trim();
   if (!url) return;
 
-  currentFilename = null;
-  currentClipFilename = null;
-  currentSubtitle = '';
-  currentFileSize = null;
+  // Reset state and UI
+  state = { ...state, videoId: null, title: null, filename: null, clipFilename: null, checkData: null };
+  document.getElementById('exists-banner').classList.remove('show');
+  document.getElementById('vinfo').classList.remove('show');
+  document.getElementById('subtitle-area').style.display = 'none';
+  document.getElementById('cut-btn').disabled = true;
+  document.getElementById('dl-pb').style.width = '0%';
+  document.getElementById('check-pb').style.width = '0%';
+  setMsg('check-msg', '', 'Checking…');
+  setMsg('dl-msg', '', '');
+  document.getElementById('check-btn').disabled = true;
+
+  try {
+    const res  = await fetch('/api/check', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({url}) });
+    const data = await res.json();
+    poll(data.job_id, 'check-pb', 'check-msg', (d) => {
+      document.getElementById('check-btn').disabled = false;
+      state.checkData   = d;
+      state.videoId     = d.video_id;
+      state.title       = d.title;
+      state.durationStr = d.duration_str;
+      state.durationSec = d.duration_sec;
+      state.thumbnail   = d.thumbnail;
+
+      if (d.exists) {
+        state.filename = d.filename;
+        setMsg('check-msg', 'ok', '✓ Found in library');
+        showVinfo({ ...d, size_mb: d.size_mb }, false);
+        document.getElementById('exists-banner').classList.add('show');
+        document.getElementById('cut-btn').disabled = false;
+        document.getElementById('cut-hint').textContent = 'Ready: ' + d.filename;
+      } else {
+        setMsg('check-msg', '', 'Not downloaded yet');
+        showVinfo(d, true);
+      }
+    }, () => { document.getElementById('check-btn').disabled = false; });
+  } catch(e) {
+    document.getElementById('check-btn').disabled = false;
+    setMsg('check-msg', 'err', '✗ Request failed');
+  }
+}
+
+function useExisting() {
+  document.getElementById('cut-btn').disabled = false;
+  document.getElementById('cut-hint').textContent = 'Ready: ' + (state.filename || '');
+  document.getElementById('exists-banner').classList.remove('show');
+  setMsg('check-msg', 'ok', '✓ Using existing: ' + state.filename);
+  // Also enable download button? No, it's already downloaded.
+}
+
+function forceDownload() {
+  document.getElementById('exists-banner').classList.remove('show');
+  startDownload();
+}
+
+// ── STEP 1b: DOWNLOAD ──────────────────────────────────────────────────────
+async function startDownload() {
+  const url = document.getElementById('url-input').value.trim();
+  if (!url) { setMsg('dl-msg', 'err', '✗ Enter a URL first'); return; }
 
   document.getElementById('dl-btn').disabled = true;
-  document.getElementById('cut-btn').disabled = true;
-  document.getElementById('dl-info').style.display = 'none';
-  document.getElementById('cut-info').style.display = 'none';
-  document.getElementById('subtitle-area').style.display = 'none';
   document.getElementById('dl-pb').style.width = '0%';
   setMsg('dl-msg', '', 'Downloading video and subtitles...');
 
@@ -611,20 +724,15 @@ async function startDownload() {
     const data = await res.json();
 
     poll(data.job_id, 'dl-pb', 'dl-msg', (d) => {
-      currentFilename = d.filename;
-      currentSubtitle = d.subtitle_text || '';
-      currentFileSize = d.size_mb || 0;
-      setMsg('dl-msg', 'ok', `✓ Ready — ${d.filename} (${formatBytes(currentFileSize)})`);
-      document.getElementById('dl-title').textContent = d.title;
-      document.getElementById('dl-meta').textContent = 'Duration: ' + d.duration_str + '  ·  Size: ' + formatBytes(currentFileSize);
-      document.getElementById('dl-info').style.display = '';
-      document.getElementById('dl-full-btn').disabled = false;
+      state.filename = d.filename;
+      state.subtitleText = d.subtitle_text || '';
+      setMsg('dl-msg', 'ok', `✓ Downloaded: ${d.filename} (${d.size_mb} MB)`);
+      showVinfo({ ...state, size_mb: d.size_mb }, false);
       document.getElementById('cut-btn').disabled = false;
-      document.getElementById('dl-btn').disabled = false;
-
-      if (currentSubtitle) {
+      document.getElementById('cut-hint').textContent = 'Ready: ' + d.filename;
+      if (state.subtitleText) {
         document.getElementById('subtitle-area').style.display = '';
-        document.getElementById('subtitle-text').value = currentSubtitle;
+        document.getElementById('subtitle-text').value = state.subtitleText;
       }
       loadDownloadsList();
     }, () => {
@@ -636,137 +744,51 @@ async function startDownload() {
   }
 }
 
+// ── Subtitles only ─────────────────────────────────────────────────────────
 async function fetchSubtitlesOnly() {
   const url = document.getElementById('url-input').value.trim();
-  if (!url) { setMsg('dl-msg', 'err', '✗ Enter a YouTube URL'); return; }
-
-  document.getElementById('dl-btn').disabled = true;
-  document.getElementById('cut-btn').disabled = true;
-  document.getElementById('dl-info').style.display = 'none';
-  document.getElementById('cut-info').style.display = 'none';
-  document.getElementById('subtitle-area').style.display = 'none';
+  if (!url) { setMsg('dl-msg', 'err', '✗ Enter a URL first'); return; }
+  setMsg('dl-msg', '', 'Fetching subtitles...');
   document.getElementById('dl-pb').style.width = '0%';
-  setMsg('dl-msg', '', 'Fetching subtitles only...');
-
   try {
     const res = await fetch('/api/subtitles-only', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url })
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({url})
     });
     const data = await res.json();
-
     poll(data.job_id, 'dl-pb', 'dl-msg', (d) => {
-      currentSubtitle = d.subtitle_text || '';
+      state.subtitleText = d.subtitle_text || '';
       setMsg('dl-msg', 'ok', `✓ Subtitles ready: ${d.title}`);
-      document.getElementById('dl-title').textContent = d.title;
-      document.getElementById('dl-meta').textContent = 'Subtitles only (no video)';
-      document.getElementById('dl-info').style.display = '';
-      document.getElementById('dl-full-btn').disabled = true;
-      document.getElementById('cut-btn').disabled = true;
-      document.getElementById('dl-btn').disabled = false;
-
-      if (currentSubtitle) {
-        document.getElementById('subtitle-area').style.display = '';
-        document.getElementById('subtitle-text').value = currentSubtitle;
-      } else {
-        document.getElementById('subtitle-area').style.display = '';
-        document.getElementById('subtitle-text').value = 'No English subtitles found.';
-      }
-    }, () => {
-      document.getElementById('dl-btn').disabled = false;
+      document.getElementById('subtitle-area').style.display = '';
+      document.getElementById('subtitle-text').value = state.subtitleText || '(none found)';
     });
-  } catch(e) {
-    document.getElementById('dl-btn').disabled = false;
-    setMsg('dl-msg', 'err', '✗ Request failed');
-  }
+  } catch(e) { setMsg('dl-msg', 'err', '✗ Request failed'); }
 }
 
 async function fetchAndCopySegments() {
   const url = document.getElementById('url-input').value.trim();
-  if (!url) { setMsg('dl-msg', 'err', '✗ Enter a YouTube URL'); return; }
-
-  setMsg('dl-msg', '', 'Fetching subtitle segments...');
+  if (!url) { setMsg('dl-msg', 'err', '✗ Enter a URL'); return; }
+  setMsg('dl-msg', '', 'Fetching segments...');
   try {
     const res = await fetch('/api/subtitles-segments', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url })
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({url})
     });
     const data = await res.json();
-
     poll(data.job_id, 'dl-pb', 'dl-msg', (d) => {
-      const segmentsJson = JSON.stringify(d.segments, null, 2);
-      navigator.clipboard.writeText(segmentsJson);
-      setMsg('dl-msg', 'ok', `✓ Segments copied to clipboard! (${d.segments.length} segments)`);
-      document.getElementById('subtitle-text').value = segmentsJson;
-    }, () => {
-      setMsg('dl-msg', 'err', '✗ Failed to fetch segments');
+      const jsonStr = JSON.stringify(d.segments, null, 2);
+      navigator.clipboard.writeText(jsonStr);
+      setMsg('dl-msg', 'ok', `✓ ${d.segments.length} segments copied to clipboard`);
+      document.getElementById('subtitle-text').value = jsonStr;
     });
-  } catch(e) {
-    setMsg('dl-msg', 'err', '✗ Request failed');
-  }
-}
-
-async function startCut() {
-  if (!currentFilename) { setMsg('cut-msg', 'err', '✗ Download a video first'); return; }
-
-  const from = document.getElementById('ts-from').value.trim();
-  const to   = document.getElementById('ts-to').value.trim();
-  if (!from || !to) { setMsg('cut-msg', 'err', '✗ Both timestamps required'); return; }
-
-  // Validate format (simple regex)
-  const tsPattern = /^\d{1,2}:\d{1,2}:\d{2}(?:\.\d{1,3})?$/;
-  if (!tsPattern.test(from)) { setMsg('cut-msg', 'err', '✗ Invalid start timestamp (use HH:MM:SS.mmm)'); return; }
-  if (!tsPattern.test(to))   { setMsg('cut-msg', 'err', '✗ Invalid end timestamp (use HH:MM:SS.mmm)'); return; }
-
-  currentClipFilename = null;
-  document.getElementById('cut-btn').disabled = true;
-  document.getElementById('cut-info').style.display = 'none';
-  document.getElementById('cut-pb').style.width = '0%';
-  setMsg('cut-msg', '', 'Cutting clip...');
-
-  try {
-    const cutMode = document.querySelector('input[name="cut-mode"]:checked')?.value || 'normal';
-    const res = await fetch('/api/cut', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ source_filename: currentFilename, ts_from: from, ts_to: to, mode: cutMode })
-    });
-    const data = await res.json();
-
-    poll(data.job_id, 'cut-pb', 'cut-msg', (d) => {
-      currentClipFilename = d.clip_filename;
-      setMsg('cut-msg', 'ok', `✓ Clip ready — ${d.from} → ${d.to}`);
-      document.getElementById('cut-title').textContent = d.clip_filename;
-      document.getElementById('cut-info').style.display = '';
-      document.getElementById('cut-dl-btn').disabled = false;
-      document.getElementById('cut-btn').disabled = false;
-      downloadClip();
-    }, () => {
-      document.getElementById('cut-btn').disabled = false;
-    });
-  } catch(e) {
-    document.getElementById('cut-btn').disabled = false;
-    setMsg('cut-msg', 'err', '✗ Request failed');
-  }
-}
-
-function downloadFull() {
-  if (currentFilename) {
-    window.location.href = '/api/download-file/video/' + encodeURIComponent(currentFilename);
-  }
-}
-
-function downloadClip() {
-  if (currentClipFilename) {
-    window.location.href = '/api/download-file/clip/' + encodeURIComponent(currentClipFilename);
-  }
+  } catch(e) { setMsg('dl-msg', 'err', '✗ Request failed'); }
 }
 
 function copySubtitle() {
-  const textarea = document.getElementById('subtitle-text');
-  textarea.select();
+  const ta = document.getElementById('subtitle-text');
+  ta.select();
   document.execCommand('copy');
   const btn = document.querySelector('.copy-btn');
   const orig = btn.textContent;
@@ -774,43 +796,88 @@ function copySubtitle() {
   setTimeout(() => { btn.textContent = orig; }, 1500);
 }
 
+// ── STEP 2: CUT ────────────────────────────────────────────────────────────
+async function startCut() {
+  if (!state.filename) { setMsg('cut-msg', 'err', '✗ No video selected'); return; }
+  const from = document.getElementById('ts-from').value.trim();
+  const to   = document.getElementById('ts-to').value.trim();
+  if (!from || !to) { setMsg('cut-msg', 'err', '✗ Both timestamps required'); return; }
+  const tsRe = /^\d{1,2}:\d{1,2}:\d{2}(?:\.\d{1,3})?$/;
+  if (!tsRe.test(from)) { setMsg('cut-msg', 'err', '✗ Invalid From timestamp'); return; }
+  if (!tsRe.test(to))   { setMsg('cut-msg', 'err', '✗ Invalid To timestamp'); return; }
+
+  const cutMode = document.querySelector('input[name="cut-mode"]:checked')?.value || 'normal';
+  state.clipFilename = null;
+  document.getElementById('cut-btn').disabled = true;
+  document.getElementById('cut-info').style.display = 'none';
+  document.getElementById('cut-pb').style.width = '0%';
+  setMsg('cut-msg', '', cutMode === '9:16' ? 'Cutting and converting 9:16…' : 'Cutting clip…');
+
+  try {
+    const res = await fetch('/api/cut', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ source_filename: state.filename, ts_from: from, ts_to: to, mode: cutMode })
+    });
+    const data = await res.json();
+    poll(data.job_id, 'cut-pb', 'cut-msg', (d) => {
+      state.clipFilename = d.clip_filename;
+      document.getElementById('cut-btn').disabled = false;
+      setMsg('cut-msg', 'ok', `✓ Done — ${d.from} → ${d.to}`);
+      document.getElementById('cut-title').textContent = d.clip_filename;
+      document.getElementById('cut-info').style.display = '';
+      document.getElementById('cut-dl-btn').disabled = false;
+      loadDownloadsList();
+    }, () => { document.getElementById('cut-btn').disabled = false; });
+  } catch(e) {
+    document.getElementById('cut-btn').disabled = false;
+    setMsg('cut-msg', 'err', '✗ Request failed');
+  }
+}
+
+function downloadClip() {
+  if (state.clipFilename)
+    window.location.href = '/api/download-file/clip/' + encodeURIComponent(state.clipFilename);
+}
+
+// ── Library: click to select video for cutting ─────────────────────────────
+function selectVideo(filename) {
+  state.filename = filename;
+  document.getElementById('cut-btn').disabled = false;
+  document.getElementById('cut-hint').textContent = 'Ready: ' + filename;
+  setMsg('cut-msg', '', '');
+  document.getElementById('cut-info').style.display = 'none';
+  // Highlight selected
+  document.querySelectorAll('#downloads-list .file-item').forEach(el => {
+    el.classList.toggle('active', el.dataset.fn === filename);
+  });
+}
+
 async function deleteFile(filename) {
   if (!confirm(`Delete "${filename}"?`)) return;
   try {
     const res = await fetch('/api/downloads/' + encodeURIComponent(filename), { method: 'DELETE' });
     if (res.ok) {
-      loadDownloadsList();
-      if (currentFilename === filename) {
-        currentFilename = null;
-        currentClipFilename = null;
-        document.getElementById('dl-info').style.display = 'none';
+      if (state.filename === filename) {
+        state.filename = null;
         document.getElementById('cut-btn').disabled = true;
+        document.getElementById('cut-hint').textContent = 'Select or download a video first.';
       }
-      setMsg('dl-msg', 'ok', `✓ Deleted ${filename}`);
+      loadDownloadsList();
     } else {
       const err = await res.json();
       setMsg('dl-msg', 'err', `✗ Delete failed: ${err.detail}`);
     }
-  } catch(e) {
-    setMsg('dl-msg', 'err', '✗ Delete request failed');
-  }
+  } catch(e) { setMsg('dl-msg', 'err', '✗ Delete request failed'); }
 }
 
 async function deleteClip(filename) {
   if (!confirm(`Delete "${filename}"?`)) return;
   try {
     const res = await fetch('/api/clips/' + encodeURIComponent(filename), { method: 'DELETE' });
-    if (res.ok) {
-      loadDownloadsList();
-    } else {
-      const err = await res.json();
-      alert(`Delete failed: ${err.detail}`);
-    }
-  } catch(e) {
-    alert('Delete request failed');
-  }
+    if (res.ok) loadDownloadsList();
+    else alert('Delete failed');
+  } catch(e) { alert('Delete failed'); }
 }
-
 
 async function loadDownloadsList() {
   const videoContainer = document.getElementById('downloads-list');
@@ -821,25 +888,29 @@ async function loadDownloadsList() {
     const res  = await fetch('/api/downloads/list');
     const data = await res.json();
 
-    // Videos
     if (!data.videos.length) {
       videoContainer.innerHTML = '<div class="msg">No downloaded videos yet.</div>';
     } else {
       videoContainer.innerHTML = data.videos.map(f => `
-        <div class="file-item">
+        <div class="file-item" data-fn="${escapeHtml(f.filename)}" onclick="selectVideo('${escapeHtml(f.filename)}')">
           <div class="file-info">
             <div class="file-name">${escapeHtml(f.filename)}</div>
             <div class="file-meta">${f.size_mb} MB · ${f.modified}</div>
           </div>
-          <div class="file-actions">
+          <div class="file-actions" onclick="event.stopPropagation()">
             <a href="/api/download-file/video/${encodeURIComponent(f.filename)}" class="sec" style="padding:5px 12px;border-radius:6px;text-decoration:none;color:var(--text);border:1px solid var(--border);">⬇ Download</a>
             <button class="delete-btn" onclick="deleteFile('${escapeHtml(f.filename)}')">🗑 Delete</button>
           </div>
         </div>
       `).join('');
+      // Re-apply active state
+      if (state.filename) {
+        document.querySelectorAll('#downloads-list .file-item').forEach(el => {
+          el.classList.toggle('active', el.dataset.fn === state.filename);
+        });
+      }
     }
 
-    // Clips
     if (!data.clips.length) {
       clipContainer.innerHTML = '<div class="msg">No clips yet.</div>';
     } else {
@@ -862,19 +933,16 @@ async function loadDownloadsList() {
   }
 }
 
-
-function escapeHtml(str) {
-  return str.replace(/[&<>]/g, function(m) {
-    if (m === '&') return '&amp;';
-    if (m === '<') return '&lt;';
-    if (m === '>') return '&gt;';
-    return m;
-  });
-}
-
 document.getElementById('url-input').addEventListener('keydown', e => {
-  if (e.key === 'Enter') startDownload();
+  if (e.key === 'Enter') startCheck();
 });
+document.getElementById('cut-hint') || (() => {
+  const hint = document.createElement('div');
+  hint.id = 'cut-hint';
+  hint.className = 'hint';
+  hint.textContent = 'Select or download a video first.';
+  document.querySelector('#cut-btn').parentNode.insertBefore(hint, document.getElementById('cut-btn'));
+})();
 
 loadDownloadsList();
 </script>
@@ -884,6 +952,9 @@ loadDownloadsList();
 # ---------------------------------------------------------------------------
 # PYDANTIC MODELS
 # ---------------------------------------------------------------------------
+class CheckRequest(BaseModel):
+    url: str
+
 class DownloadRequest(BaseModel):
     url: str
 
@@ -891,7 +962,7 @@ class CutRequest(BaseModel):
     source_filename: str
     ts_from: str
     ts_to: str
-    mode: str = "normal"  # "normal" | "9:16"
+    mode: str = "normal"
 
     @validator('ts_from', 'ts_to')
     def validate_timestamp(cls, v):
@@ -908,6 +979,13 @@ class SubtitleOnlyRequest(BaseModel):
 @app.get("/", response_class=HTMLResponse)
 async def index():
     return HTMLResponse(content=HTML)
+
+@app.post("/api/check")
+async def api_check(req: CheckRequest):
+    job_id = str(uuid.uuid4())
+    job_set(job_id, "running")
+    threading.Thread(target=check_worker, args=(job_id, req.url), daemon=True).start()
+    return {"job_id": job_id}
 
 @app.post("/api/download")
 async def api_download(req: DownloadRequest):
@@ -955,7 +1033,6 @@ async def list_downloads():
             "size_mb": round(stat.st_size / (1024 * 1024), 2),
             "modified": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
         })
-
     clips = []
     for f in sorted(CLIPS.glob("*.mp4"), key=lambda p: p.stat().st_mtime, reverse=True):
         stat = f.stat()
@@ -964,30 +1041,23 @@ async def list_downloads():
             "size_mb": round(stat.st_size / (1024 * 1024), 2),
             "modified": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
         })
-
     return {"videos": videos, "clips": clips}
-    
+
 @app.delete("/api/clips/{filename}")
 async def delete_clip(filename: str):
     path = CLIPS / filename
     if not path.exists():
         raise HTTPException(404, "File not found")
-    try:
-        path.unlink()
-        return {"message": f"Deleted {filename}"}
-    except Exception as e:
-        raise HTTPException(500, f"Delete failed: {str(e)}")
+    path.unlink()
+    return {"message": f"Deleted {filename}"}
 
 @app.delete("/api/downloads/{filename}")
 async def delete_download(filename: str):
     path = DOWNLOADS / filename
     if not path.exists():
         raise HTTPException(404, "File not found")
-    try:
-        path.unlink()
-        return {"message": f"Deleted {filename}"}
-    except Exception as e:
-        raise HTTPException(500, f"Delete failed: {str(e)}")
+    path.unlink()
+    return {"message": f"Deleted {filename}"}
 
 @app.get("/api/download-file/video/{filename}")
 async def download_video(filename: str):
