@@ -458,6 +458,20 @@ textarea.sub-ta{width:100%;background:var(--surface2);border:1px solid var(--bor
 .fitem-dl:hover{background:var(--accent);color:#fff}
 .hint{font-size:11px;color:var(--muted);line-height:1.6}
 .sep{height:1px;background:var(--border)}
+
+@media (max-width:1024px){
+.layout{grid-template-columns:1fr}
+.col-right{order:-1}
+}
+@media (max-width:768px){
+.layout{padding:0 12px;gap:12px;margin:12px auto}
+.row,.ts-grid{display:flex;flex-direction:column}
+.vinfo{flex-direction:column}
+.vinfo-thumb{width:100%;height:auto;aspect-ratio:16/9}
+.card-bd{padding:14px}
+.file-list{max-height:none}
+}
+
 </style>
 </head>
 <body>
@@ -517,8 +531,9 @@ textarea.sub-ta{width:100%;background:var(--surface2);border:1px solid var(--bor
         </button>
         <div class="sub-body" id="sub-body">
           <div class="sub-actions">
-            <button class="sub-copy-btn" onclick="copySubText()">Copy Text</button>
-            <button class="sub-copy-btn" onclick="fetchAndCopySegments()">Copy Segments JSON</button>
+            <button class="sub-copy-btn" onclick="showTranscriptText()">Transcript</button>
+            <button class="sub-copy-btn" onclick="showTranscriptJson()">JSON</button>
+            <button class="sub-copy-btn" onclick="copyCurrentSubtitleView()">Copy Current View</button>
           </div>
           <textarea class="sub-ta" id="subtitle-text" rows="7" readonly></textarea>
         </div>
@@ -597,6 +612,8 @@ let state = {
   filename: null,        // active filename for cutting
   clipFilename: null,
   subtitleText: '',
+  subtitleSegments: [],
+  subtitleMode: 'text',
   checkData: null,       // raw data from last check
 };
 
@@ -757,43 +774,76 @@ async function fetchSubtitlesOnly() {
     poll(data.job_id, 'dl-pb', 'dl-msg', (d) => {
       state.subtitleText = d.subtitle_text || '';
       setMsg('dl-msg', 'ok', '✓ Subtitles ready');
-      document.getElementById('subtitle-text').value = state.subtitleText || '(none found)';
+      showTranscriptText();
       document.getElementById('sub-accordion').style.display = '';
     });
   } catch(e) { setMsg('dl-msg', 'err', '✗ Request failed'); }
+}
+
+
+async function copyToClipboard(text){
+  try{
+    await navigator.clipboard.writeText(text);
+  }catch(e){
+    const ta=document.createElement('textarea');
+    ta.value=text;
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand('copy');
+    document.body.removeChild(ta);
+  }
 }
 
 async function fetchAndCopySegments() {
+  if (state.subtitleSegments.length) {
+    showTranscriptJson();
+    await copyCurrentSubtitleView();
+    return;
+  }
+
   const url = document.getElementById('url-input').value.trim();
   if (!url) { setMsg('dl-msg', 'err', '✗ Enter a URL'); return; }
+
   setMsg('dl-msg', '', 'Fetching segments…');
+
   try {
-    const res  = await fetch('/api/subtitles-segments', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({url}) });
-    const data = await res.json();
-    poll(data.job_id, 'dl-pb', 'dl-msg', (d) => {
-      const json = JSON.stringify(d.segments, null, 2);
-      navigator.clipboard.writeText(json);
-      document.getElementById('subtitle-text').value = json;
-      document.getElementById('sub-accordion').style.display = '';
-      // Open it
-      const body = document.getElementById('sub-body');
-      const tog  = document.getElementById('sub-toggle');
-      body.classList.add('open'); tog.classList.add('open');
-      setMsg('dl-msg', 'ok', `✓ ${d.segments.length} segments copied to clipboard`);
+    const res = await fetch('/api/subtitles-segments', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({url})
     });
-  } catch(e) { setMsg('dl-msg', 'err', '✗ Request failed'); }
+
+    const data = await res.json();
+
+    poll(data.job_id, 'dl-pb', 'dl-msg', async (d) => {
+      state.subtitleSegments = d.segments || [];
+      showTranscriptJson();
+      await copyCurrentSubtitleView();
+      setMsg('dl-msg', 'ok', `✓ ${state.subtitleSegments.length} segments loaded`);
+    });
+  } catch(e) {
+    setMsg('dl-msg', 'err', '✗ Request failed');
+  }
 }
 
-// ── Subtitle accordion ─────────────────────────────────────────────────────
-function toggleSub() {
-  document.getElementById('sub-body').classList.toggle('open');
-  document.getElementById('sub-toggle').classList.toggle('open');
+function showTranscriptText(){
+  state.subtitleMode='text';
+  document.getElementById('subtitle-text').value=state.subtitleText || '(none found)';
 }
+
+function showTranscriptJson(){
+  state.subtitleMode='json';
+  document.getElementById('subtitle-text').value=JSON.stringify(state.subtitleSegments || [], null, 2);
+}
+
+async function copyCurrentSubtitleView(){
+  const ta=document.getElementById('subtitle-text');
+  await copyToClipboard(ta.value || '');
+  setMsg('dl-msg','ok','✓ Copied to clipboard');
+}
+
 function copySubText() {
-  const ta = document.getElementById('subtitle-text');
-  navigator.clipboard.writeText(ta.value).then(() => {
-    setMsg('dl-msg', 'ok', '✓ Text copied to clipboard');
-  });
+  copyCurrentSubtitleView();
 }
 
 // ── STEP 2: CUT ────────────────────────────────────────────────────────────
