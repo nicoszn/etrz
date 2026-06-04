@@ -626,13 +626,9 @@ button:disabled{opacity:.35;cursor:not-allowed}
       <div class="title">Export Segments with Schema</div>
     </div>
     <div class="card-body">
-      <div class="hint">
-        Merges the current segmented subtitle (if any) into the hardcoded JSON schema and copies the result.
-      </div>
+      <div class="hint">Merges the current segmented subtitle (if any) into the hardcoded JSON schema and copies the result.</div>
       <div class="row">
-        <button id="export-schema-btn" onclick="exportSegmentsWithSchema()" disabled>
-          📋 Copy JSON (Schema + Segments)
-        </button>
+        <button id="export-schema-btn" onclick="exportSegmentsWithSchema()" disabled>📋 Copy JSON (Schema + Segments)</button>
       </div>
       <div class="msg" id="export-msg"></div>
     </div>
@@ -655,7 +651,7 @@ let state = {
   checkData: null,
 };
 
-// ── Hardcoded JSON schema (transcript array is empty – will be replaced at runtime) ──
+// Hardcoded JSON schema (transcript array is empty – will be replaced at runtime)
 const HARDCODED_SCHEMA = {
   "instruction_profile": {
     "system_instruction": "You are a short-form content strategist and clip intelligence engine. Your job is to analyze the provided transcript and produce a ranked list of clip blueprints, each conforming to the output schema defined below.",
@@ -732,7 +728,7 @@ const HARDCODED_SCHEMA = {
   }
 };
 
-// ── Robust clipboard copy (works on iOS and all browsers) ─────────────────
+// ── Robust clipboard copy ─────────────────────────────────────────────────
 async function copyToClipboard(text, successMsg = '✓ Copied to clipboard') {
   try {
     await navigator.clipboard.writeText(text);
@@ -784,7 +780,6 @@ function poll(jid, pbId, msgId, onDone, onFail) {
     }
   }, 900);
 }
-
 function showVinfo(data, showDlBtn) {
   document.getElementById('vinfo-thumb').src = data.thumbnail || '';
   document.getElementById('vinfo-title').textContent = data.title || '';
@@ -797,7 +792,6 @@ function showVinfo(data, showDlBtn) {
 async function startCheck() {
   const url = document.getElementById('url-input').value.trim();
   if (!url) return;
-
   state = { ...state, videoId: null, title: null, filename: null, clipFilename: null, checkData: null };
   document.getElementById('exists-banner').classList.remove('show');
   document.getElementById('vinfo').classList.remove('show');
@@ -808,10 +802,8 @@ async function startCheck() {
   setMsg('check-msg', '', 'Checking…');
   setMsg('dl-msg', '', '');
   document.getElementById('check-btn').disabled = true;
-  // Disable export button until new segments are fetched
   document.getElementById('export-schema-btn').disabled = true;
   setMsg('export-msg', '', '');
-
   try {
     const res = await fetch('/api/check', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({url}) });
     const data = await res.json();
@@ -823,7 +815,6 @@ async function startCheck() {
       state.durationStr = d.duration_str;
       state.durationSec = d.duration_sec;
       state.thumbnail = d.thumbnail;
-
       if (d.exists) {
         state.filename = d.filename;
         setMsg('check-msg', 'ok', '✓ Found in library');
@@ -841,14 +832,12 @@ async function startCheck() {
     setMsg('check-msg', 'err', '✗ Request failed');
   }
 }
-
 function useExisting() {
   document.getElementById('cut-btn').disabled = false;
   document.getElementById('cut-hint').textContent = 'Ready: ' + (state.filename || '');
   document.getElementById('exists-banner').classList.remove('show');
   setMsg('check-msg', 'ok', '✓ Using existing: ' + state.filename);
 }
-
 function forceDownload() {
   document.getElementById('exists-banner').classList.remove('show');
   startDownload();
@@ -858,11 +847,9 @@ function forceDownload() {
 async function startDownload() {
   const url = document.getElementById('url-input').value.trim();
   if (!url) { setMsg('dl-msg', 'err', '✗ Enter a URL first'); return; }
-
   document.getElementById('dl-btn').disabled = true;
   document.getElementById('dl-pb').style.width = '0%';
   setMsg('dl-msg', '', 'Downloading video and subtitles...');
-
   try {
     const res = await fetch('/api/download', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url }) });
     const data = await res.json();
@@ -903,7 +890,6 @@ async function fetchSubtitlesOnly() {
   } catch(e) { setMsg('dl-msg', 'err', '✗ Request failed'); }
 }
 
-// ── Transcript copy ────────────────────────────────────────────────────────
 function copyTranscript() {
   if (state.subtitleText) {
     copyToClipboard(state.subtitleText, '✓ Transcript copied');
@@ -912,17 +898,14 @@ function copyTranscript() {
   }
 }
 
-// ── Segments copy (fetch once, then reuse) ─────────────────────────────────
 async function copySegments() {
   if (state.subtitleSegments.length > 0) {
     const jsonStr = JSON.stringify(state.subtitleSegments, null, 2);
     copyToClipboard(jsonStr, `✓ ${state.subtitleSegments.length} segments copied`);
     return;
   }
-
   const url = document.getElementById('url-input').value.trim();
   if (!url) { setMsg('dl-msg', 'err', '✗ Enter a URL first'); return; }
-
   setMsg('dl-msg', '', 'Fetching segments...');
   try {
     const res = await fetch('/api/subtitles-segments', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url }) });
@@ -932,7 +915,6 @@ async function copySegments() {
       const jsonStr = JSON.stringify(state.subtitleSegments, null, 2);
       copyToClipboard(jsonStr, `✓ ${state.subtitleSegments.length} segments copied`);
       document.getElementById('subtitle-text').value = jsonStr;
-      // Enable the export button now that segments are available
       document.getElementById('export-schema-btn').disabled = false;
     });
   } catch(e) {
@@ -940,22 +922,37 @@ async function copySegments() {
   }
 }
 
-// ── Export segments with schema (replaces the transcript array) ─────────────
 async function exportSegmentsWithSchema() {
   if (!state.subtitleSegments || state.subtitleSegments.length === 0) {
     setMsg('export-msg', 'err', '✗ No segmented subtitles available. First fetch segments using "Copy Segments (JSON)" button.');
     return;
   }
-  // Deep copy the schema and inject the current segments into data_payload.transcript
   const exportObj = JSON.parse(JSON.stringify(HARDCODED_SCHEMA));
   exportObj.data_payload.transcript = state.subtitleSegments;
-  // Also set the source_video_id to the current video ID (if available)
-  if (state.videoId) {
-    exportObj.data_payload.source_video_id = state.videoId;
-  }
+  if (state.videoId) exportObj.data_payload.source_video_id = state.videoId;
   const jsonStr = JSON.stringify(exportObj, null, 2);
   await copyToClipboard(jsonStr, '✓ Schema + segments copied to clipboard');
   setMsg('export-msg', 'ok', `✓ Exported ${state.subtitleSegments.length} segments with schema`);
+}
+
+// ── 9:16 conversion for clips ──────────────────────────────────────────────
+async function convertTo916(filename) {
+  if (!confirm(`Convert "${filename}" to 9:16 vertical format? A new file will be created.`)) return;
+  setMsg('dl-msg', '', `Converting ${filename}...`);
+  try {
+    const res = await fetch('/api/clip/convert-to-916/' + encodeURIComponent(filename), { method: 'POST' });
+    if (!res.ok) throw new Error(await res.text());
+    const data = await res.json();
+    poll(data.job_id, 'dl-pb', 'dl-msg', (d) => {
+      setMsg('dl-msg', 'ok', `✓ Converted: ${d.new_filename} (${d.size_mb} MB)`);
+      loadDownloadsList();
+    }, () => {
+      setMsg('dl-msg', 'err', '✗ Conversion failed');
+    });
+  } catch(e) {
+    console.error(e);
+    setMsg('dl-msg', 'err', '✗ Request failed: ' + e.message);
+  }
 }
 
 // ── STEP 2: CUT ────────────────────────────────────────────────────────────
@@ -967,14 +964,12 @@ async function startCut() {
   const tsRe = /^\d{1,2}:\d{1,2}:\d{2}(?:\.\d{1,3})?$/;
   if (!tsRe.test(from)) { setMsg('cut-msg', 'err', '✗ Invalid From timestamp'); return; }
   if (!tsRe.test(to)) { setMsg('cut-msg', 'err', '✗ Invalid To timestamp'); return; }
-
   const cutMode = document.querySelector('input[name="cut-mode"]:checked')?.value || 'normal';
   state.clipFilename = null;
   document.getElementById('cut-btn').disabled = true;
   document.getElementById('cut-info').style.display = 'none';
   document.getElementById('cut-pb').style.width = '0%';
   setMsg('cut-msg', '', cutMode === '9:16' ? 'Cutting and converting 9:16…' : 'Cutting clip…');
-
   try {
     const res = await fetch('/api/cut', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ source_filename: state.filename, ts_from: from, ts_to: to, mode: cutMode }) });
     const data = await res.json();
@@ -994,7 +989,6 @@ async function startCut() {
     setMsg('cut-msg', 'err', '✗ Request failed');
   }
 }
-
 function downloadClip() {
   if (state.clipFilename) window.location.href = '/api/download-file/clip/' + encodeURIComponent(state.clipFilename);
 }
@@ -1010,7 +1004,6 @@ function selectVideo(filename) {
     el.classList.toggle('active', el.dataset.fn === filename);
   });
 }
-
 async function deleteFile(filename) {
   if (!confirm(`Delete "${filename}"?`)) return;
   try {
@@ -1028,7 +1021,6 @@ async function deleteFile(filename) {
     }
   } catch(e) { setMsg('dl-msg', 'err', '✗ Delete request failed'); }
 }
-
 async function deleteClip(filename) {
   if (!confirm(`Delete "${filename}"?`)) return;
   try {
@@ -1037,46 +1029,16 @@ async function deleteClip(filename) {
     else alert('Delete failed');
   } catch(e) { alert('Delete failed'); }
 }
-
-async function convertTo916(filename) {
-    if (!confirm(`Convert "${filename}" to 9:16 vertical format? A new file will be created.`)) return;
-    setMsg('dl-msg', '', `Converting ${filename}...`);
-    try {
-        const res = await fetch('/api/clip/convert-to-916/' + encodeURIComponent(filename), { method: 'POST' });
-        const data = await res.json();
-        poll(data.job_id, 'dl-pb', 'dl-msg', (d) => {
-            setMsg('dl-msg', 'ok', `✓ Converted: ${d.new_filename} (${d.size_mb} MB)`);
-            loadDownloadsList();  // refresh library
-        }, () => {
-            setMsg('dl-msg', 'err', '✗ Conversion failed');
-        });
-    } catch(e) {
-        setMsg('dl-msg', 'err', '✗ Request failed');
-    }
-}
-
-
 async function loadDownloadsList() {
   const videoContainer = document.getElementById('downloads-list');
   const clipContainer = document.getElementById('clips-list');
   videoContainer.innerHTML = '<div class="msg">Loading...</div>';
-  clipContainer.innerHTML = data.clips.map(f => `
-    <div class="file-item">
-        <div class="file-info">
-            <div class="file-name">${escapeHtml(f.filename)}</div>
-            <div class="file-meta">${f.size_mb} MB · ${f.modified}</div>
-        </div>
-        <div class="file-actions">
-            <button class="sec" style="padding:5px 12px;border-radius:6px;" onclick="convertTo916('${escapeHtml(f.filename)}')">9:16</button>
-            <a href="/api/download-file/clip/${encodeURIComponent(f.filename)}" class="sec" style="padding:5px 12px;border-radius:6px;text-decoration:none;color:var(--text);border:1px solid var(--border);">⬇ Download</a>
-            <button class="delete-btn" onclick="deleteClip('${escapeHtml(f.filename)}')">🗑 Delete</button>
-        </div>
-    </div>
-`).join('');
+  clipContainer.innerHTML = '<div class="msg">Loading...</div>';
   try {
     const res = await fetch('/api/downloads/list');
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
-    if (!data.videos.length) {
+    if (!data.videos || !data.videos.length) {
       videoContainer.innerHTML = '<div class="msg">No downloaded videos yet.</div>';
     } else {
       videoContainer.innerHTML = data.videos.map(f => `
@@ -1097,28 +1059,33 @@ async function loadDownloadsList() {
         });
       }
     }
-    if (!data.clips.length) {
+    if (!data.clips || !data.clips.length) {
       clipContainer.innerHTML = '<div class="msg">No clips yet.</div>';
     } else {
-      clipContainer.innerHTML = data.clips.map(f => `
-        <div class="file-item">
-          <div class="file-info">
-            <div class="file-name">${escapeHtml(f.filename)}</div>
-            <div class="file-meta">${f.size_mb} MB · ${f.modified}</div>
+      clipContainer.innerHTML = data.clips.map(f => {
+        const safeName = escapeHtml(f.filename);
+        const encodedName = encodeURIComponent(f.filename);
+        return `
+          <div class="file-item">
+            <div class="file-info">
+              <div class="file-name">${safeName}</div>
+              <div class="file-meta">${f.size_mb} MB · ${f.modified}</div>
+            </div>
+            <div class="file-actions">
+              <button class="sec" style="padding:5px 12px;border-radius:6px;" onclick="convertTo916('${safeName.replace(/'/g, "\\'")}')">9:16</button>
+              <a href="/api/download-file/clip/${encodedName}" class="sec" style="padding:5px 12px;border-radius:6px;text-decoration:none;color:var(--text);border:1px solid var(--border);">⬇ Download</a>
+              <button class="delete-btn" onclick="deleteClip('${safeName.replace(/'/g, "\\'")}')">🗑 Delete</button>
+            </div>
           </div>
-          <div class="file-actions">
-            <a href="/api/download-file/clip/${encodeURIComponent(f.filename)}" class="sec" style="padding:5px 12px;border-radius:6px;text-decoration:none;color:var(--text);border:1px solid var(--border);">⬇ Download</a>
-            <button class="delete-btn" onclick="deleteClip('${escapeHtml(f.filename)}')">🗑 Delete</button>
-          </div>
-        </div>
-      `).join('');
+        `;
+      }).join('');
     }
   } catch(e) {
-    videoContainer.innerHTML = '<div class="msg err">Failed to load.</div>';
-    clipContainer.innerHTML = '<div class="msg err">Failed to load.</div>';
+    console.error('Library load error:', e);
+    videoContainer.innerHTML = '<div class="msg err">Failed to load videos: ' + e.message + '</div>';
+    clipContainer.innerHTML = '<div class="msg err">Failed to load clips: ' + e.message + '</div>';
   }
 }
-
 document.getElementById('url-input').addEventListener('keydown', e => { if (e.key === 'Enter') startCheck(); });
 loadDownloadsList();
 </script>
