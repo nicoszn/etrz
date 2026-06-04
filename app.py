@@ -409,6 +409,7 @@ def convert_to_916_worker(job_id: str, filename: str):
         video_filter = "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black"
         cmd = [
             "ffmpeg", "-y",
+            "-threads", "1",
             "-i", str(source),
             "-vf", video_filter,
             "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
