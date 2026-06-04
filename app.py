@@ -392,6 +392,44 @@ def cut_worker(job_id: str, source_filename: str, ts_from: str, ts_to: str, mode
     except Exception as ex:
         job_set(job_id, "error", error=str(ex))
 
+def convert_to_916_worker(job_id: str, filename: str):
+    try:
+        source = CLIPS / filename
+        if not source.exists():
+            raise RuntimeError(f"Clip not found: {filename}")
+
+        # Create new filename with suffix
+        stem = source.stem
+        new_filename = f"{stem}_9_16.mp4"
+        out_file = CLIPS / new_filename
+
+        # Single‑step re‑encode with scale+pad filter
+        video_filter = "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black"
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", str(source),
+            "-vf", video_filter,
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "128k",
+            "-movflags", "+faststart",
+            str(out_file)
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)  # 3 minutes max for small clips
+
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip()[-400:])
+
+        if not out_file.exists() or out_file.stat().st_size < 1000:
+            raise RuntimeError("Output file missing or empty")
+
+        job_set(job_id, "done", {"new_filename": new_filename, "size_mb": get_file_size_mb(out_file)})
+
+    except Exception as ex:
+        job_set(job_id, "error", error=str(ex))
+
+
+
 # ---------------------------------------------------------------------------
 # INLINE HTML (updated with check button and full integration like app-1)
 # ---------------------------------------------------------------------------
@@ -1000,11 +1038,41 @@ async function deleteClip(filename) {
   } catch(e) { alert('Delete failed'); }
 }
 
+async function convertTo916(filename) {
+    if (!confirm(`Convert "${filename}" to 9:16 vertical format? A new file will be created.`)) return;
+    setMsg('dl-msg', '', `Converting ${filename}...`);
+    try {
+        const res = await fetch('/api/clip/convert-to-916/' + encodeURIComponent(filename), { method: 'POST' });
+        const data = await res.json();
+        poll(data.job_id, 'dl-pb', 'dl-msg', (d) => {
+            setMsg('dl-msg', 'ok', `✓ Converted: ${d.new_filename} (${d.size_mb} MB)`);
+            loadDownloadsList();  // refresh library
+        }, () => {
+            setMsg('dl-msg', 'err', '✗ Conversion failed');
+        });
+    } catch(e) {
+        setMsg('dl-msg', 'err', '✗ Request failed');
+    }
+}
+
+
 async function loadDownloadsList() {
   const videoContainer = document.getElementById('downloads-list');
   const clipContainer = document.getElementById('clips-list');
   videoContainer.innerHTML = '<div class="msg">Loading...</div>';
-  clipContainer.innerHTML = '<div class="msg">Loading...</div>';
+  clipContainer.innerHTML = data.clips.map(f => `
+    <div class="file-item">
+        <div class="file-info">
+            <div class="file-name">${escapeHtml(f.filename)}</div>
+            <div class="file-meta">${f.size_mb} MB · ${f.modified}</div>
+        </div>
+        <div class="file-actions">
+            <button class="sec" style="padding:5px 12px;border-radius:6px;" onclick="convertTo916('${escapeHtml(f.filename)}')">9:16</button>
+            <a href="/api/download-file/clip/${encodeURIComponent(f.filename)}" class="sec" style="padding:5px 12px;border-radius:6px;text-decoration:none;color:var(--text);border:1px solid var(--border);">⬇ Download</a>
+            <button class="delete-btn" onclick="deleteClip('${escapeHtml(f.filename)}')">🗑 Delete</button>
+        </div>
+    </div>
+`).join('');
   try {
     const res = await fetch('/api/downloads/list');
     const data = await res.json();
@@ -1190,3 +1258,10 @@ async def download_clip(filename: str):
         filename=filename,
         headers={"Content-Disposition": f"attachment; filename*=UTF-8''{filename}"}
     )
+
+@app.post("/api/clip/convert-to-916/{filename}")
+async def api_convert_to_916(filename: str):
+    job_id = str(uuid.uuid4())
+    job_set(job_id, "running")
+    threading.Thread(target=convert_to_916_worker, args=(job_id, filename), daemon=True).start()
+    return {"job_id": job_id}
