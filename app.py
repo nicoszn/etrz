@@ -393,6 +393,7 @@ def cut_worker(job_id: str, source_filename: str, ts_from: str, ts_to: str, mode
     except Exception as ex:
         job_set(job_id, "error", error=str(ex))
 
+
 def convert_to_916_worker(job_id: str, filename: str):
     try:
         source = CLIPS / filename
@@ -416,10 +417,14 @@ def convert_to_916_worker(job_id: str, filename: str):
             "-movflags", "+faststart",
             str(out_file)
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)  # 3 minutes max for small clips
+        
+        # Execute the command safely
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
 
         if result.returncode != 0:
-            raise RuntimeError(result.stderr.strip()[-400:])
+            # Capture more stderr text to ensure you see the real FFmpeg error
+            error_msg = result.stderr.strip()[-2000:] if result.stderr else "Unknown FFmpeg error"
+            raise RuntimeError(f"FFmpeg failed: {error_msg}")
 
         if not out_file.exists() or out_file.stat().st_size < 1000:
             raise RuntimeError("Output file missing or empty")
@@ -428,6 +433,7 @@ def convert_to_916_worker(job_id: str, filename: str):
 
     except Exception as ex:
         job_set(job_id, "error", error=str(ex))
+
 
 
 
