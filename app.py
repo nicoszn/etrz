@@ -140,34 +140,106 @@ def get_video_metadata(url: str) -> dict:
     return json.loads(res.stdout.strip())
 
 def normalize_formats(metadata: dict) -> list:
-    """Extract useful formats with resolution and estimated size."""
+    """
+    Extract formats, rank them per resolution using a preference score.
+    Returns one best format per resolution.
+    Ranking: mp4 > webm > other containers,
+             h265 (hevc) > h264 > vp9 > other codecs,
+             smaller file size preferred when tie.
+    """
+    from collections import defaultdict
+
     formats = metadata.get("formats", [])
-    video_formats = []
+    res_map = defaultdict(list)
+
+    # Container preference order (lower index = better)
+    container_priority = {
+        "mp4": 1,
+        "m4a": 2,   # rarely has video, but keep
+        "webm": 3,
+        "mkv": 4,
+        "avi": 5,
+        "mov": 6,
+    }
+    # Codec preference (hevc > h264 > vp9 > others)
+    codec_priority = {
+        "hevc": 1,
+        "h265": 1,
+        "avc1": 2,   # h264
+        "h264": 2,
+        "vp9": 3,
+        "av01": 4,
+        "vp8": 5,
+    }
+
     for f in formats:
-        # Must have video and audio, or at least video (best we can do)
-        if f.get("vcodec") != "none" and f.get("acodec") != "none":
-            height = f.get("height")
-            if not height and "p" in f.get("format_note", ""):
-                try:
-                    height = int(f.get("format_note", "").replace("p", ""))
-                except:
-                    height = None
-            if height is None:
-                continue
-            size_mb = None
-            if f.get("filesize"):
-                size_mb = round(f["filesize"] / (1024 * 1024), 1)
-            elif f.get("filesize_approx"):
-                size_mb = round(f["filesize_approx"] / (1024 * 1024), 1)
-            video_formats.append({
-                "format_id": f["format_id"],
-                "resolution": f"{height}p",
-                "ext": f.get("ext", "mp4"),
-                "size_mb": size_mb,
-            })
+        # Do NOT filter by vcodec/acodec – keep all, but we'll prefer those with both later
+        height = f.get("height")
+        if not height and "p" in f.get("format_note", ""):
+            try:
+                height = int(f.get("format_note", "").replace("p", ""))
+            except:
+                height = None
+        if height is None:
+            continue
+
+        # Estimate size (allow None)
+        size_mb = None
+        if f.get("filesize"):
+            size_mb = round(f["filesize"] / (1024 * 1024), 1)
+        elif f.get("filesize_approx"):
+            size_mb = round(f["filesize_approx"] / (1024 * 1024), 1)
+
+        # Determine container and codec
+        ext = f.get("ext", "").lower()
+        vcodec = f.get("vcodec", "").lower()
+        # Extract codec name (e.g., "avc1.4d401e" -> "avc1", "hevc" -> "hevc")
+        codec = vcodec.split('.')[0] if vcodec else "unknown"
+
+        container_score = container_priority.get(ext, 99)
+        codec_score = codec_priority.get(codec, 99)
+
+        # Bonus if both video and audio present (avoid separate streams)
+        has_both = (f.get("vcodec") != "none" and f.get("acodec") != "none")
+        both_bonus = -10 if has_both else 0  # lower score is better
+
+        # Composite score: lower = better
+        # Primary: container, then codec, then size (if known), then both bonus
+        # We'll combine into a tuple for sorting
+        # Use 0 for None size (will be sorted last within same container/codec)
+        size_score = size_mb if size_mb is not None else 1e9
+
+        rank_tuple = (
+            container_score,
+            codec_score,
+            size_score,
+            both_bonus,
+        )
+
+        res_map[height].append({
+            "format_id": f["format_id"],
+            "resolution": f"{height}p",
+            "ext": ext,
+            "size_mb": size_mb,
+            "rank": rank_tuple,
+        })
+
+    # For each resolution, pick the format with smallest rank tuple
+    unique_formats = []
+    for height, entries in res_map.items():
+        # Sort by the rank tuple
+        entries.sort(key=lambda x: x["rank"])
+        best = entries[0]
+        unique_formats.append({
+            "format_id": best["format_id"],
+            "resolution": best["resolution"],
+            "ext": best["ext"],
+            "size_mb": best["size_mb"],  # may be None
+        })
+
     # Sort by resolution descending
-    video_formats.sort(key=lambda x: int(x["resolution"].rstrip("p")), reverse=True)
-    return video_formats
+    unique_formats.sort(key=lambda x: int(x["resolution"].rstrip("p")), reverse=True)
+    return unique_formats
 
 # ---------------------------------------------------------------------------
 # WORKERS (updated with format_id support)
