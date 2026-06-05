@@ -1,4 +1,3 @@
-import os
 import re
 import json
 import uuid
@@ -11,9 +10,9 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 # DIRECTORIES
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 BASE_DIR = Path(__file__).parent
 COOKIES = BASE_DIR / "cookies.txt"
 DOWNLOADS = BASE_DIR / "downloads"
@@ -22,19 +21,19 @@ TEMP = BASE_DIR / "temp"
 DOWNLOADS.mkdir(exist_ok=True)
 TEMP.mkdir(exist_ok=True)
 
-app = FastAPI(title="YTExtract (Beta)")
+app = FastAPI(title="ClipForge")
 
-# ---------------------------------------------------------------------------
-# JOB STORE (simple, no cleanup)
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
+# SIMPLE JOB STORE
+# ----------------------------------------------------------------------
 JOBS = {}
 
 def job_set(job_id, state, data=None, error=None):
     JOBS[job_id] = {"state": state, "data": data or {}, "error": error}
 
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 # UTILITIES
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 def seconds_to_ts(s: float) -> str:
     s = round(s, 3)
     h = int(s // 3600)
@@ -64,9 +63,9 @@ def extract_plain_text_from_vtt(vtt_path: Path) -> str:
 def get_file_size_mb(path):
     return round(path.stat().st_size / (1024 * 1024), 2) if path.exists() else 0.0
 
-# ---------------------------------------------------------------------------
-# METADATA & FORMATS (smart filter, min 360p, one per resolution)
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
+# METADATA & SMART FORMATS (min 360p, one per resolution)
+# ----------------------------------------------------------------------
 def get_video_metadata(url: str) -> dict:
     cmd = ytdlp_base() + ["--dump-json", "--no-playlist", url]
     res = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
@@ -78,8 +77,8 @@ def normalize_formats(metadata: dict) -> list:
     formats = metadata.get("formats", [])
     res_map = defaultdict(list)
 
-    container_priority = {"mp4": 1, "m4a": 2, "webm": 3, "mkv": 4, "avi": 5, "mov": 6}
-    codec_priority = {"hevc": 1, "h265": 1, "avc1": 2, "h264": 2, "vp9": 3, "av01": 4, "vp8": 5}
+    container_priority = {"mp4": 1, "webm": 2, "mkv": 3}
+    codec_priority = {"hevc": 1, "h265": 1, "avc1": 2, "h264": 2, "vp9": 3, "av01": 4}
 
     for f in formats:
         height = f.get("height")
@@ -117,7 +116,7 @@ def normalize_formats(metadata: dict) -> list:
         })
 
     unique = []
-    for height, entries in res_map.items():
+    for entries in res_map.values():
         entries.sort(key=lambda x: x["rank"])
         best = entries[0]
         unique.append({
@@ -129,9 +128,9 @@ def normalize_formats(metadata: dict) -> list:
     unique.sort(key=lambda x: int(x["resolution"].rstrip("p")), reverse=True)
     return unique
 
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 # WORKERS
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 def download_cache_worker(job_id, url, format_id):
     try:
         meta = get_video_metadata(url)
@@ -170,25 +169,9 @@ def download_cache_worker(job_id, url, format_id):
     except Exception as ex:
         job_set(job_id, "error", error=str(ex))
 
-def subtitle_worker(job_id, url):
-    try:
-        meta = get_video_metadata(url)
-        title = meta.get("title", "untitled")
-        tmp_base = TEMP / f"sub_{job_id}"
-        sub_cmd = ytdlp_base() + ["--skip-download", "--write-auto-subs", "--write-subs",
-                                  "--sub-langs", "en", "--sub-format", "vtt",
-                                  "-o", str(tmp_base), url]
-        subprocess.run(sub_cmd, capture_output=True, timeout=60)
-        vtt_path = Path(str(tmp_base) + ".en.vtt")
-        sub_text = extract_plain_text_from_vtt(vtt_path)
-        vtt_path.unlink(missing_ok=True)
-        job_set(job_id, "done", {"subtitle_text": sub_text})
-    except Exception as ex:
-        job_set(job_id, "error", error=str(ex))
-
-# ---------------------------------------------------------------------------
-# API ENDPOINTS (only needed ones)
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
+# API ENDPOINTS
+# ----------------------------------------------------------------------
 class UrlRequest(BaseModel):
     url: str
 
@@ -235,110 +218,242 @@ async def api_download_cache(req: DownloadCacheRequest):
     threading.Thread(target=download_cache_worker, args=(job_id, req.url, req.format_id), daemon=True).start()
     return {"job_id": job_id}
 
-@app.post("/api/subtitle")
-async def api_subtitle(req: UrlRequest):
-    job_id = str(uuid.uuid4())
-    job_set(job_id, "running")
-    threading.Thread(target=subtitle_worker, args=(job_id, req.url), daemon=True).start()
-    return {"job_id": job_id}
-
 @app.get("/api/job/{job_id}")
 async def api_job(job_id: str):
     return JOBS.get(job_id, {"state": "not_found"})
 
-# ---------------------------------------------------------------------------
-# MINIMAL HTML (video source only)
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
+# MINIMAL HTML – ONE SCREEN, NO SCROLLING, COPY BUTTON ONLY AFTER CACHE
+# ----------------------------------------------------------------------
 HTML = r"""<!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>YTE · Video & Subtitle</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=yes">
+<title>ClipForge · Stream & Cache</title>
 <style>
-*{box-sizing:border-box;margin:0;padding:0}
-body{background:#0f0f11;color:#e8e8f0;font-family:monospace;padding:2rem}
-.container{max-width:900px;margin:0 auto}
-.card{background:#1a1a1f;border:1px solid #2e2e38;border-radius:16px;padding:24px}
-h1{font-size:1.5rem;margin-bottom:0.5rem}
-.sub{color:#6b6b80;margin-bottom:1.5rem}
-input,button{font-family:inherit}
-input[type=text]{width:100%;background:#222228;border:1px solid #2e2e38;color:#e8e8f0;padding:10px;border-radius:8px;margin-bottom:12px}
-.row{display:flex;gap:10px;margin-bottom:16px}
-button{background:#7c5cfc;color:#fff;border:none;padding:8px 16px;border-radius:8px;cursor:pointer}
-button:hover{opacity:0.85}
-button.sec{background:#222228;border:1px solid #2e2e38;color:#e8e8f0}
-.pw{background:#2e2e38;border-radius:4px;height:3px;margin:8px 0}
-.pb{height:100%;width:0%;background:linear-gradient(90deg,#7c5cfc,#fc5c7d);transition:width 0.3s}
-.pb.spin{animation:spin 1.4s infinite;width:35%}
-@keyframes spin{0%{transform:translateX(-100%)}100%{transform:translateX(380%)}}
-.msg{font-size:12px;min-height:20px;margin:8px 0}
-.msg.ok{color:#4caf88}.msg.err{color:#fc5c5c}
-.vinfo{display:flex;gap:12px;background:#222228;border-radius:12px;padding:12px;margin-bottom:16px}
-.vinfo img{width:120px;border-radius:8px}
-.vinfo div{flex:1}
-table{width:100%;border-collapse:collapse;margin:12px 0}
-th,td{padding:8px;text-align:left;border-top:1px solid #2e2e38}
-button.small{padding:4px 12px;font-size:11px}
-.checkbox{display:flex;align-items:center;gap:8px;margin:12px 0}
+  * {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+  }
+  body {
+    background: #0f0f11;
+    color: #e8e8f0;
+    font-family: system-ui, -apple-system, 'Segoe UI', monospace;
+    height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 1rem;
+  }
+  .card {
+    max-width: 700px;
+    width: 100%;
+    background: #1a1a1f;
+    border: 1px solid #2e2e38;
+    border-radius: 1.5rem;
+    padding: 1.5rem;
+    box-shadow: 0 8px 20px rgba(0,0,0,0.4);
+  }
+  h1 {
+    font-size: 1.6rem;
+    font-weight: 600;
+    background: linear-gradient(135deg, #7c5cfc, #fc5c7d);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    margin-bottom: 0.25rem;
+  }
+  .sub {
+    font-size: 0.8rem;
+    color: #6b6b80;
+    margin-bottom: 1.2rem;
+  }
+  input {
+    width: 100%;
+    background: #222228;
+    border: 1px solid #2e2e38;
+    color: #e8e8f0;
+    padding: 0.7rem 1rem;
+    border-radius: 0.8rem;
+    font-size: 0.9rem;
+    margin-bottom: 0.8rem;
+  }
+  button {
+    background: #7c5cfc;
+    color: white;
+    border: none;
+    padding: 0.6rem 1.2rem;
+    border-radius: 0.8rem;
+    font-weight: 500;
+    cursor: pointer;
+    transition: opacity 0.2s;
+    font-size: 0.85rem;
+  }
+  button:hover { opacity: 0.85; }
+  button.sec {
+    background: #222228;
+    border: 1px solid #2e2e38;
+    color: #e8e8f0;
+  }
+  .row {
+    display: flex;
+    gap: 0.6rem;
+    flex-wrap: wrap;
+    margin-bottom: 1rem;
+  }
+  .pb {
+    background: #2e2e38;
+    border-radius: 0.25rem;
+    height: 3px;
+    overflow: hidden;
+    margin: 0.5rem 0;
+  }
+  .bar {
+    width: 0%;
+    height: 100%;
+    background: linear-gradient(90deg, #7c5cfc, #fc5c7d);
+    transition: width 0.2s;
+  }
+  .bar.spin {
+    animation: spin 1.4s infinite ease-in-out;
+    width: 35% !important;
+  }
+  @keyframes spin {
+    0% { transform: translateX(-100%); }
+    100% { transform: translateX(380%); }
+  }
+  .msg {
+    font-size: 0.75rem;
+    min-height: 1.4rem;
+    margin: 0.3rem 0;
+  }
+  .ok { color: #4caf88; }
+  .err { color: #fc5c5c; }
+  .vinfo {
+    display: flex;
+    gap: 0.8rem;
+    background: #222228;
+    border-radius: 1rem;
+    padding: 0.8rem;
+    margin: 0.8rem 0;
+  }
+  .vinfo img {
+    width: 90px;
+    border-radius: 0.5rem;
+    object-fit: cover;
+  }
+  .vinfo div {
+    overflow: hidden;
+  }
+  .vinfo strong {
+    font-size: 0.9rem;
+    display: block;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .vinfo span {
+    font-size: 0.75rem;
+    color: #6b6b80;
+  }
+  .format-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.8rem;
+  }
+  .format-table th, .format-table td {
+    padding: 0.5rem 0.2rem;
+    text-align: left;
+    border-top: 1px solid #2e2e38;
+  }
+  .format-table th {
+    color: #6b6b80;
+    font-weight: 500;
+  }
+  button.small {
+    padding: 0.25rem 0.7rem;
+    font-size: 0.7rem;
+  }
+  .checkbox {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin: 0.8rem 0;
+  }
+  .copy-row {
+    display: flex;
+    justify-content: flex-end;
+    margin-top: 0.5rem;
+  }
+  @media (max-width: 550px) {
+    .card { padding: 1rem; }
+    .vinfo img { width: 70px; }
+    .format-table td, .format-table th { font-size: 0.7rem; padding: 0.4rem 0.1rem; }
+    button.small { padding: 0.2rem 0.5rem; }
+  }
 </style>
 </head>
 <body>
-<div class="container">
-  <div class="card">
-    <h1>⬡ ClipForge · Stream & Subtitle</h1>
-    <div class="sub">YouTube → choose quality → stream or cache</div>
+<div class="card">
+  <h1>⬡ ClipForge</h1>
+  <div class="sub">YouTube → choose quality → stream or cache</div>
 
-    <input type="text" id="url" placeholder="https://youtube.com/watch?v=..." />
-    <div class="row">
-      <button id="analyze" onclick="analyze()">Analyze</button>
-      <button class="sec" id="subtitleBtn" onclick="fetchSubtitle()" disabled>Subtitle (copy)</button>
-    </div>
+  <input type="text" id="url" placeholder="https://youtube.com/watch?v=..." />
+  <div class="row">
+    <button id="analyzeBtn" onclick="analyze()">Analyze</button>
+  </div>
 
-    <div class="pw"><div class="pb" id="analyzePb"></div></div>
-    <div class="msg" id="msg"></div>
+  <div class="pb"><div class="bar" id="analyzeBar"></div></div>
+  <div class="msg" id="msg"></div>
 
-    <div id="vinfo" style="display:none" class="vinfo">
-      <img id="thumb" src="" />
-      <div><strong id="title"></strong><br/><span id="duration"></span></div>
-    </div>
+  <div id="vinfo" style="display:none" class="vinfo">
+    <img id="thumb" src="" />
+    <div><strong id="title"></strong><span id="duration"></span></div>
+  </div>
 
-    <div id="formatContainer"></div>
+  <div id="formatContainer"></div>
 
-    <div class="checkbox">
-      <input type="checkbox" id="cacheCheckbox" />
-      <label>Save to Library (cached on server)</label>
-    </div>
+  <div class="checkbox">
+    <input type="checkbox" id="cacheCheckbox" />
+    <label>💾 Save to server (cached) – shows subtitle copy button</label>
+  </div>
 
-    <div class="pw"><div class="pb" id="dlPb"></div></div>
-    <div class="msg" id="dlMsg"></div>
+  <div class="pb"><div class="bar" id="dlBar"></div></div>
+  <div class="msg" id="dlMsg"></div>
+
+  <div id="copyContainer" class="copy-row" style="display:none">
+    <button id="copySubBtn" onclick="copySubtitle()" class="sec">📋 Copy subtitle</button>
   </div>
 </div>
 
 <script>
-let subtitleText = "";
+let state = { subtitleText: "", jobSubtitleText: "" };
 
 async function analyze() {
   const url = document.getElementById('url').value.trim();
   if (!url) return;
   setMsg('', 'Fetching formats...');
-  setPb('analyzePb', true);
+  setBar('analyzeBar', true);
   document.getElementById('formatContainer').innerHTML = '';
   document.getElementById('vinfo').style.display = 'none';
-  document.getElementById('subtitleBtn').disabled = true;
+  document.getElementById('copyContainer').style.display = 'none';
+  state.subtitleText = '';
   try {
     const res = await fetch('/api/formats', {
       method: 'POST',
-      headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({url})
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url })
     });
     if (!res.ok) throw new Error(await res.text());
     const data = await res.json();
     document.getElementById('thumb').src = data.thumbnail || '';
-    document.getElementById('title').innerText = data.title;
-    document.getElementById('duration').innerText = 'Duration: ' + (data.duration_str || '?');
+    document.getElementById('title').innerText = data.title || '';
+    document.getElementById('duration').innerText = '  Duration: ' + (data.duration_str || '?');
     document.getElementById('vinfo').style.display = 'flex';
 
-    let html = '<table><thead><tr><th>Quality</th><th>Format</th><th>Size</th><th></th></tr></thead><tbody>';
+    let html = '<table class="format-table"><thead><tr><th>Quality</th><th>Format</th><th>Size</th><th></th></tr></thead><tbody>';
     for (let f of data.formats) {
       let size = f.size_mb ? f.size_mb + ' MB' : 'unknown';
       html += `<tr>
@@ -348,12 +463,11 @@ async function analyze() {
     }
     html += '</tbody></table>';
     document.getElementById('formatContainer').innerHTML = html;
-    setMsg('ok', `✓ ${data.formats.length} formats available`);
-    document.getElementById('subtitleBtn').disabled = false;
+    setMsg('ok', `✓ ${data.formats.length} format(s) available`);
   } catch(err) {
     setMsg('err', err.message);
   } finally {
-    setPb('analyzePb', false);
+    setBar('analyzeBar', false);
   }
 }
 
@@ -361,61 +475,50 @@ function selectFormat(formatId) {
   const url = document.getElementById('url').value.trim();
   const cache = document.getElementById('cacheCheckbox').checked;
   if (cache) {
-    setPb('dlPb', true);
-    setMsg('', 'Downloading & saving...', 'dlMsg');
+    setBar('dlBar', true);
+    setMsg('', 'Downloading & caching...', 'dlMsg');
     fetch('/api/download-cache', {
       method: 'POST',
-      headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({url, format_id: formatId})
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url, format_id: formatId })
     })
     .then(res => res.json())
     .then(data => {
-      poll(data.job_id, 'dlPb', 'dlMsg', (d) => {
-        subtitleText = d.subtitle_text || '';
+      poll(data.job_id, 'dlBar', 'dlMsg', (d) => {
+        state.subtitleText = d.subtitle_text || '';
         setMsg('ok', `✓ Saved: ${d.filename} (${d.size_mb} MB)`, 'dlMsg');
+        if (state.subtitleText) {
+          document.getElementById('copyContainer').style.display = 'flex';
+        } else {
+          document.getElementById('copyContainer').style.display = 'none';
+        }
       });
     })
-    .catch(err => { setPb('dlPb', false); setMsg('err', err.message, 'dlMsg'); });
+    .catch(err => { setBar('dlBar', false); setMsg('err', err.message, 'dlMsg'); });
   } else {
     window.location.href = `/api/stream?url=${encodeURIComponent(url)}&format_id=${formatId}`;
   }
 }
 
-async function fetchSubtitle() {
-  const url = document.getElementById('url').value.trim();
-  if (!url) { setMsg('err', 'Enter a URL first', 'dlMsg'); return; }
-  setPb('dlPb', true);
-  setMsg('', 'Fetching subtitles...', 'dlMsg');
-  try {
-    const res = await fetch('/api/subtitle', {
-      method: 'POST',
-      headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({url})
-    });
-    const data = await res.json();
-    poll(data.job_id, 'dlPb', 'dlMsg', (d) => {
-      if (d.subtitle_text) {
-        copyToClipboard(d.subtitle_text);
-        setMsg('ok', '✓ Subtitle copied to clipboard', 'dlMsg');
-      } else {
-        setMsg('err', 'No English subtitles found', 'dlMsg');
-      }
-    });
-  } catch(err) {
-    setPb('dlPb', false);
-    setMsg('err', err.message, 'dlMsg');
+function copySubtitle() {
+  if (state.subtitleText) {
+    copyToClipboard(state.subtitleText);
+    setMsg('ok', '✓ Subtitle copied to clipboard', 'dlMsg');
+  } else {
+    setMsg('err', 'No subtitle available', 'dlMsg');
   }
 }
 
+// helpers
 function setMsg(cls, txt, id='msg') {
   const el = document.getElementById(id);
   el.className = 'msg ' + (cls === 'ok' ? 'ok' : (cls === 'err' ? 'err' : ''));
   el.textContent = txt;
 }
-function setPb(id, on) {
-  const pb = document.getElementById(id);
-  if (on) { pb.classList.add('spin'); pb.style.width = '35%'; }
-  else { pb.classList.remove('spin'); pb.style.width = '0%'; }
+function setBar(id, on) {
+  const bar = document.getElementById(id);
+  if (on) { bar.classList.add('spin'); bar.style.width = '35%'; }
+  else { bar.classList.remove('spin'); bar.style.width = '0%'; }
 }
 async function copyToClipboard(text) {
   try {
@@ -429,23 +532,23 @@ async function copyToClipboard(text) {
     document.body.removeChild(ta);
   }
 }
-function poll(jobId, pbId, msgId, onDone) {
+function poll(jobId, barId, msgId, onDone) {
   const interval = setInterval(async () => {
     try {
       const res = await fetch('/api/job/' + jobId);
       const data = await res.json();
       if (data.state === 'done') {
         clearInterval(interval);
-        setPb(pbId, false);
+        setBar(barId, false);
         onDone(data.data);
       } else if (data.state === 'error') {
         clearInterval(interval);
-        setPb(pbId, false);
+        setBar(barId, false);
         setMsg('err', '✗ ' + data.error, msgId);
       }
     } catch(e) {
       clearInterval(interval);
-      setPb(pbId, false);
+      setBar(barId, false);
       setMsg('err', 'Network error', msgId);
     }
   }, 900);
@@ -457,3 +560,7 @@ function poll(jobId, pbId, msgId, onDone) {
 @app.get("/", response_class=HTMLResponse)
 async def index():
     return HTMLResponse(content=HTML)
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
