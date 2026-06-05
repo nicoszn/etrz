@@ -142,7 +142,7 @@ def get_video_metadata(url: str) -> dict:
 def normalize_formats(metadata: dict) -> list:
     """
     Extract formats, rank them per resolution using a preference score.
-    Returns one best format per resolution.
+    Returns one best format per resolution, minimum 360p.
     Ranking: mp4 > webm > other containers,
              h265 (hevc) > h264 > vp9 > other codecs,
              smaller file size preferred when tie.
@@ -155,7 +155,7 @@ def normalize_formats(metadata: dict) -> list:
     # Container preference order (lower index = better)
     container_priority = {
         "mp4": 1,
-        "m4a": 2,   # rarely has video, but keep
+        "m4a": 2,
         "webm": 3,
         "mkv": 4,
         "avi": 5,
@@ -165,7 +165,7 @@ def normalize_formats(metadata: dict) -> list:
     codec_priority = {
         "hevc": 1,
         "h265": 1,
-        "avc1": 2,   # h264
+        "avc1": 2,
         "h264": 2,
         "vp9": 3,
         "av01": 4,
@@ -173,7 +173,7 @@ def normalize_formats(metadata: dict) -> list:
     }
 
     for f in formats:
-        # Do NOT filter by vcodec/acodec – keep all, but we'll prefer those with both later
+        # Extract height
         height = f.get("height")
         if not height and "p" in f.get("format_note", ""):
             try:
@@ -183,6 +183,10 @@ def normalize_formats(metadata: dict) -> list:
         if height is None:
             continue
 
+        # --- NEW: Minimum quality filter (360p) ---
+        if height < 360:
+            continue
+
         # Estimate size (allow None)
         size_mb = None
         if f.get("filesize"):
@@ -190,23 +194,18 @@ def normalize_formats(metadata: dict) -> list:
         elif f.get("filesize_approx"):
             size_mb = round(f["filesize_approx"] / (1024 * 1024), 1)
 
-        # Determine container and codec
         ext = f.get("ext", "").lower()
         vcodec = f.get("vcodec", "").lower()
-        # Extract codec name (e.g., "avc1.4d401e" -> "avc1", "hevc" -> "hevc")
         codec = vcodec.split('.')[0] if vcodec else "unknown"
 
         container_score = container_priority.get(ext, 99)
         codec_score = codec_priority.get(codec, 99)
 
-        # Bonus if both video and audio present (avoid separate streams)
+        # Bonus if both video and audio present
         has_both = (f.get("vcodec") != "none" and f.get("acodec") != "none")
-        both_bonus = -10 if has_both else 0  # lower score is better
+        both_bonus = -10 if has_both else 0
 
-        # Composite score: lower = better
-        # Primary: container, then codec, then size (if known), then both bonus
-        # We'll combine into a tuple for sorting
-        # Use 0 for None size (will be sorted last within same container/codec)
+        # Size score: if None, push to back with high value
         size_score = size_mb if size_mb is not None else 1e9
 
         rank_tuple = (
@@ -227,14 +226,13 @@ def normalize_formats(metadata: dict) -> list:
     # For each resolution, pick the format with smallest rank tuple
     unique_formats = []
     for height, entries in res_map.items():
-        # Sort by the rank tuple
         entries.sort(key=lambda x: x["rank"])
         best = entries[0]
         unique_formats.append({
             "format_id": best["format_id"],
             "resolution": best["resolution"],
             "ext": best["ext"],
-            "size_mb": best["size_mb"],  # may be None
+            "size_mb": best["size_mb"],
         })
 
     # Sort by resolution descending
