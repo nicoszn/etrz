@@ -2,17 +2,19 @@ import os
 import re
 import json
 import uuid
+import asyncio
 import subprocess
 import threading
+import time
 from pathlib import Path
 from datetime import datetime
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse
 from pydantic import BaseModel, validator
 
 # ---------------------------------------------------------------------------
-# STARTUP
+# STARTUP & DIRECTORIES
 # ---------------------------------------------------------------------------
 BASE_DIR    = Path(__file__).parent
 COOKIES     = BASE_DIR / "cookies.txt"
@@ -27,15 +29,33 @@ TEMP.mkdir(exist_ok=True)
 app = FastAPI(title="ClipForge")
 
 # ---------------------------------------------------------------------------
-# IN-MEMORY JOB STORE
+# IN-MEMORY JOB STORE with auto‑cleanup
 # ---------------------------------------------------------------------------
 JOBS: dict = {}
 
 def job_set(job_id: str, state: str, data: dict = None, error: str = None):
-    JOBS[job_id] = {"state": state, "data": data or {}, "error": error}
+    JOBS[job_id] = {
+        "state": state,
+        "data": data or {},
+        "error": error,
+        "created_at": time.time(),
+        "expires_at": time.time() + 3600   # 1 hour TTL
+    }
+
+def cleanup_jobs():
+    """Background thread: remove expired jobs every hour."""
+    while True:
+        time.sleep(3600)
+        now = time.time()
+        expired = [jid for jid, job in JOBS.items()
+                   if job.get("expires_at", 0) < now]
+        for jid in expired:
+            del JOBS[jid]
+
+threading.Thread(target=cleanup_jobs, daemon=True).start()
 
 # ---------------------------------------------------------------------------
-# UTILITIES
+# UTILITIES (same as original, plus security)
 # ---------------------------------------------------------------------------
 def seconds_to_ts(s: float) -> str:
     s = round(s, 3)
@@ -105,28 +125,66 @@ def find_existing_download(video_id: str):
         return f
     return None
 
+def secure_filename(filename: str) -> str:
+    """Prevent path traversal."""
+    return Path(filename).name
+
 # ---------------------------------------------------------------------------
-# WORKERS (from app-1)
+# NEW: METADATA + FORMAT EXTRACTION (Phase 1)
+# ---------------------------------------------------------------------------
+def get_video_metadata(url: str) -> dict:
+    cmd = ytdlp_base() + ["--dump-json", "--no-playlist", url]
+    res = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    if res.returncode != 0:
+        raise RuntimeError(res.stderr.strip())
+    return json.loads(res.stdout.strip())
+
+def normalize_formats(metadata: dict) -> list:
+    """Extract useful formats with resolution and estimated size."""
+    formats = metadata.get("formats", [])
+    video_formats = []
+    for f in formats:
+        # Must have video and audio, or at least video (best we can do)
+        if f.get("vcodec") != "none" and f.get("acodec") != "none":
+            height = f.get("height")
+            if not height and "p" in f.get("format_note", ""):
+                try:
+                    height = int(f.get("format_note", "").replace("p", ""))
+                except:
+                    height = None
+            if height is None:
+                continue
+            size_mb = None
+            if f.get("filesize"):
+                size_mb = round(f["filesize"] / (1024 * 1024), 1)
+            elif f.get("filesize_approx"):
+                size_mb = round(f["filesize_approx"] / (1024 * 1024), 1)
+            video_formats.append({
+                "format_id": f["format_id"],
+                "resolution": f"{height}p",
+                "ext": f.get("ext", "mp4"),
+                "size_mb": size_mb,
+            })
+    # Sort by resolution descending
+    video_formats.sort(key=lambda x: int(x["resolution"].rstrip("p")), reverse=True)
+    return video_formats
+
+# ---------------------------------------------------------------------------
+# WORKERS (updated with format_id support)
 # ---------------------------------------------------------------------------
 def check_worker(job_id: str, url: str):
-    """Check metadata + whether file already exists, without downloading."""
+    """Legacy check – still used to see if file exists."""
     try:
-        meta_cmd = ytdlp_base() + ["--dump-json", "--no-playlist", url]
-        meta_res = subprocess.run(meta_cmd, capture_output=True, text=True, timeout=60)
-        if meta_res.returncode != 0:
-            raise RuntimeError(meta_res.stderr.strip()[:400])
-
-        meta       = json.loads(meta_res.stdout.strip().splitlines()[-1])
-        video_id   = meta.get("id", "unknown")
-        title      = meta.get("title", "untitled")
+        meta = get_video_metadata(url)
+        video_id = meta.get("id", "unknown")
+        title = meta.get("title", "untitled")
         duration_raw = meta.get("duration", 0)
         try:
             duration_sec = float(duration_raw)
-        except (TypeError, ValueError):
+        except:
             duration_sec = 0
         duration_str = seconds_to_ts(duration_sec) if duration_sec > 0 else "00:00:00.000"
-        thumbnail    = meta.get("thumbnail", "")
-
+        thumbnail = meta.get("thumbnail", "")
         existing = find_existing_download(video_id)
         if existing:
             job_set(job_id, "done", {
@@ -153,26 +211,23 @@ def check_worker(job_id: str, url: str):
     except Exception as ex:
         job_set(job_id, "error", error=str(ex))
 
-def download_worker(job_id: str, url: str):
+def download_and_cache_worker(job_id: str, url: str, format_id: str):
+    """Download specific format and save to DOWNLOADS (cached)."""
     try:
-        meta_cmd = ytdlp_base() + ["--dump-json", "--no-playlist", url]
-        meta_res = subprocess.run(meta_cmd, capture_output=True, text=True, timeout=60)
-        if meta_res.returncode != 0:
-            raise RuntimeError(meta_res.stderr.strip()[:400])
-
-        meta = json.loads(meta_res.stdout.strip().splitlines()[-1])
+        meta = get_video_metadata(url)
         video_id = meta.get("id", "unknown")
         title = meta.get("title", "untitled")
         duration_raw = meta.get("duration", 0)
         try:
             duration_sec = float(duration_raw)
-        except (TypeError, ValueError):
+        except:
             duration_sec = 0
         duration_str = seconds_to_ts(duration_sec) if duration_sec > 0 else "00:00:00.000"
 
         safe_title = "".join(c for c in title if c.isalnum() or c in " -_").strip()[:60]
         out_file = DOWNLOADS / f"{video_id}_{safe_title}.mp4"
 
+        # If already exists, just return
         if out_file.exists():
             vtt_path = out_file.with_suffix('.en.vtt')
             sub_text = extract_plain_text_from_vtt(vtt_path) if vtt_path.exists() else ""
@@ -188,7 +243,7 @@ def download_worker(job_id: str, url: str):
             return
 
         dl_cmd = ytdlp_base() + [
-            "-S", "vcodec:h264,res,acodec:aac",
+            "-f", format_id,
             "--merge-output-format", "mp4",
             "--no-playlist",
             "-o", str(out_file),
@@ -198,6 +253,7 @@ def download_worker(job_id: str, url: str):
         if result.returncode != 0:
             raise RuntimeError(result.stderr.strip()[-400:])
 
+        # Subtitles
         vtt_path = out_file.with_suffix('.en.vtt')
         sub_cmd = ytdlp_base() + [
             "--skip-download",
@@ -224,131 +280,95 @@ def download_worker(job_id: str, url: str):
     except Exception as ex:
         job_set(job_id, "error", error=str(ex))
 
-def subtitle_only_worker(job_id: str, url: str):
+def subtitle_package_worker(job_id: str, url: str):
+    """Return both plain text and segments in one job."""
     try:
-        meta_cmd = ytdlp_base() + ["--dump-json", "--no-playlist", url]
-        meta_res = subprocess.run(meta_cmd, capture_output=True, text=True, timeout=60)
-        if meta_res.returncode != 0:
-            raise RuntimeError(meta_res.stderr.strip()[:400])
-        meta = json.loads(meta_res.stdout.strip().splitlines()[-1])
+        meta = get_video_metadata(url)
         title = meta.get("title", "untitled")
 
-        tmp_base = TEMP / f"sub_{job_id}"
-        sub_cmd = ytdlp_base() + [
+        # Get plain text (vtt)
+        tmp_base_vtt = TEMP / f"sub_{job_id}"
+        sub_cmd_vtt = ytdlp_base() + [
             "--skip-download",
             "--write-auto-subs",
             "--write-subs",
             "--sub-langs", "en",
             "--sub-format", "vtt",
-            "-o", str(tmp_base),
+            "-o", str(tmp_base_vtt),
             url
         ]
-        subprocess.run(sub_cmd, capture_output=True, timeout=60)
-        vtt_path = Path(str(tmp_base) + ".en.vtt")
-        sub_text = extract_plain_text_from_vtt(vtt_path)
+        subprocess.run(sub_cmd_vtt, capture_output=True, timeout=60)
+        vtt_path = Path(str(tmp_base_vtt) + ".en.vtt")
+        plain_text = extract_plain_text_from_vtt(vtt_path)
         vtt_path.unlink(missing_ok=True)
 
-        job_set(job_id, "done", {
-            "title": title,
-            "subtitle_text": sub_text,
-        })
-    except Exception as ex:
-        job_set(job_id, "error", error=str(ex))
-
-def subtitle_segments_worker(job_id: str, url: str):
-    try:
-        meta_cmd = ytdlp_base() + ["--dump-json", "--no-playlist", url]
-        meta_res = subprocess.run(meta_cmd, capture_output=True, text=True, timeout=60)
-        if meta_res.returncode != 0:
-            raise RuntimeError(meta_res.stderr.strip()[:400])
-        meta = json.loads(meta_res.stdout.strip().splitlines()[-1])
-        title = meta.get("title", "untitled")
-
-        tmp_base = TEMP / f"segments_{job_id}"
-        sub_cmd = ytdlp_base() + [
+        # Get segments (json3)
+        tmp_base_json = TEMP / f"segments_{job_id}"
+        sub_cmd_json = ytdlp_base() + [
             "--skip-download",
             "--write-auto-subs",
             "--write-subs",
             "--sub-langs", "en",
             "--sub-format", "json3",
-            "-o", str(tmp_base),
+            "-o", str(tmp_base_json),
             url
         ]
-        subprocess.run(sub_cmd, capture_output=True, timeout=60)
-
-        json3_path = Path(str(tmp_base) + ".en.json3")
-        if not json3_path.exists():
-            raise RuntimeError("No JSON3 subtitles found (English).")
-
-        with open(json3_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-
+        subprocess.run(sub_cmd_json, capture_output=True, timeout=60)
+        json3_path = Path(str(tmp_base_json) + ".en.json3")
         segments = []
-        for event in data.get("events", []):
-            start_ms = event.get("tStartMs", 0)
-            duration_ms = event.get("dDurationMs", 0)
-            text_parts = [seg.get("utf8", "") for seg in event.get("segs", [])]
-            text = "".join(text_parts).strip()
-            if not text or text == "\n":
-                continue
-
-            start_sec = start_ms / 1000.0
-            end_sec = (start_ms + duration_ms) / 1000.0
-            segments.append({
-                "start": seconds_to_ts(start_sec),
-                "end": seconds_to_ts(end_sec),
-                "text": text
-            })
-
-        json3_path.unlink(missing_ok=True)
+        if json3_path.exists():
+            with open(json3_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            for event in data.get("events", []):
+                start_ms = event.get("tStartMs", 0)
+                duration_ms = event.get("dDurationMs", 0)
+                text_parts = [seg.get("utf8", "") for seg in event.get("segs", [])]
+                text = "".join(text_parts).strip()
+                if not text or text == "\n":
+                    continue
+                start_sec = start_ms / 1000.0
+                end_sec = (start_ms + duration_ms) / 1000.0
+                segments.append({
+                    "start": seconds_to_ts(start_sec),
+                    "end": seconds_to_ts(end_sec),
+                    "text": text
+                })
+            json3_path.unlink(missing_ok=True)
 
         job_set(job_id, "done", {
-            "segments": segments,
             "title": title,
+            "plain_text": plain_text,
+            "segments": segments,
         })
     except Exception as ex:
         job_set(job_id, "error", error=str(ex))
 
 def cut_worker(job_id: str, source_filename: str, ts_from: str, ts_to: str, mode: str = "normal"):
+    """Same as original, but with security."""
     try:
-        if not validate_timestamp(ts_from):
-            raise ValueError(
-                f"Invalid start timestamp: {ts_from}. "
-                "Use HH:MM:SS or HH:MM:SS.mmm"
-            )
-
-        if not validate_timestamp(ts_to):
-            raise ValueError(
-                f"Invalid end timestamp: {ts_to}. "
-                "Use HH:MM:SS or HH:MM:SS.mmm"
-            )
-
+        source_filename = secure_filename(source_filename)
         source = DOWNLOADS / source_filename
-
         if not source.exists():
             raise RuntimeError(f"Source file not found: {source_filename}")
 
+        if not validate_timestamp(ts_from) or not validate_timestamp(ts_to):
+            raise ValueError("Invalid timestamps")
+
         start_seconds = _timestamp_to_seconds(ts_from)
         end_seconds = _timestamp_to_seconds(ts_to)
-
         if end_seconds <= start_seconds:
-            raise ValueError("End timestamp must be greater than start timestamp")
-
+            raise ValueError("End must be after start")
         duration = str(end_seconds - start_seconds)
 
-        # Simple UUID-based filename (from app-1)
         clip_name = f"clip_{uuid.uuid4().hex[:8]}.mp4"
         out_file = CLIPS / clip_name
 
         if mode == "9:16":
-            # Letterbox pipeline (Fits the entire source video, adds black bars)
             video_filter = "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black"
             cmd = [
-                "ffmpeg", "-y",
-                "-threads", "1",
+                "ffmpeg", "-y", "-threads", "1",
                 "-i", str(source),
-                "-ss", ts_from,
-                "-t", duration,
+                "-ss", ts_from, "-t", duration,
                 "-vf", video_filter,
                 "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
                 "-pix_fmt", "yuv420p",
@@ -357,30 +377,21 @@ def cut_worker(job_id: str, source_filename: str, ts_from: str, ts_to: str, mode
                 str(out_file)
             ]
         else:
-            # Normal stream copy mode
             cmd = [
                 "ffmpeg", "-y",
-                "-ss", ts_from,
-                "-i", str(source),
-                "-t", duration,
-                "-c", "copy",
+                "-ss", ts_from, "-i", str(source),
+                "-t", duration, "-c", "copy",
                 "-avoid_negative_ts", "make_zero",
                 "-movflags", "+faststart",
                 str(out_file)
             ]
 
-        # Single execution point for both modes
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-
         if result.returncode != 0:
-            if result.returncode == -9:
-                raise RuntimeError("FFmpeg process was killed by the system (Out of Memory). Try upgrading server RAM or adding a swap file.")
             raise RuntimeError(result.stderr.strip()[-600:])
-
         if not out_file.exists() or out_file.stat().st_size < 1000:
-            raise RuntimeError(f"Output file missing or empty. FFmpeg stderr: {result.stderr.strip()[-400:]}")
+            raise RuntimeError("Output missing or empty")
 
-        # Return combined fields from app-1 (mode, size_mb) and app-2 (from, to)
         job_set(job_id, "done", {
             "clip_filename": clip_name,
             "from": ts_from,
@@ -388,57 +399,200 @@ def cut_worker(job_id: str, source_filename: str, ts_from: str, ts_to: str, mode
             "mode": mode,
             "size_mb": get_file_size_mb(out_file),
         })
-
     except Exception as ex:
         job_set(job_id, "error", error=str(ex))
-
 
 def convert_to_916_worker(job_id: str, filename: str):
+    filename = secure_filename(filename)
+    source = CLIPS / filename
+    if not source.exists():
+        job_set(job_id, "error", error="Clip not found")
+        return
+    stem = source.stem
+    new_filename = f"{stem}_9_16.mp4"
+    out_file = CLIPS / new_filename
+    video_filter = "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black"
+    cmd = [
+        "ffmpeg", "-y", "-threads", "1",
+        "-i", str(source),
+        "-vf", video_filter,
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "128k",
+        "-movflags", "+faststart",
+        str(out_file)
+    ]
     try:
-        source = CLIPS / filename
-        if not source.exists():
-            raise RuntimeError(f"Clip not found: {filename}")
-
-        # Create new filename with suffix
-        stem = source.stem
-        new_filename = f"{stem}_9_16.mp4"
-        out_file = CLIPS / new_filename
-
-        # Single‑step re‑encode with scale+pad filter
-        video_filter = "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black"
-        cmd = [
-            "ffmpeg", "-y",
-            "-threads", "1",
-            "-i", str(source),
-            "-vf", video_filter,
-            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
-            "-pix_fmt", "yuv420p",
-            "-c:a", "aac", "-b:a", "128k",
-            "-movflags", "+faststart",
-            str(out_file)
-        ]
-        
-        # Execute the command safely
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
-
         if result.returncode != 0:
-            # Capture more stderr text to ensure you see the real FFmpeg error
-            error_msg = result.stderr.strip()[-2000:] if result.stderr else "Unknown FFmpeg error"
-            raise RuntimeError(f"FFmpeg failed: {error_msg}")
-
+            raise RuntimeError(f"FFmpeg failed: {result.stderr.strip()[-2000:]}")
         if not out_file.exists() or out_file.stat().st_size < 1000:
-            raise RuntimeError("Output file missing or empty")
-
+            raise RuntimeError("Output missing or empty")
         job_set(job_id, "done", {"new_filename": new_filename, "size_mb": get_file_size_mb(out_file)})
-
     except Exception as ex:
         job_set(job_id, "error", error=str(ex))
 
+# ---------------------------------------------------------------------------
+# API ENDPOINTS
+# ---------------------------------------------------------------------------
+class UrlRequest(BaseModel):
+    url: str
 
+class FormatRequest(BaseModel):
+    url: str
 
+class DownloadCacheRequest(BaseModel):
+    url: str
+    format_id: str
+
+class CutRequest(BaseModel):
+    source_filename: str
+    ts_from: str
+    ts_to: str
+    mode: str = "normal"
+
+    @validator('ts_from', 'ts_to')
+    def validate_timestamp(cls, v):
+        if not validate_timestamp(v):
+            raise ValueError(f"Invalid timestamp format: {v}")
+        return v
+
+# Phase 1: get formats
+@app.post("/api/formats")
+async def api_formats(req: FormatRequest):
+    try:
+        meta = get_video_metadata(req.url)
+        formats = normalize_formats(meta)
+        return {
+            "video_id": meta.get("id"),
+            "title": meta.get("title"),
+            "thumbnail": meta.get("thumbnail"),
+            "duration_str": seconds_to_ts(meta.get("duration", 0)),
+            "formats": formats
+        }
+    except Exception as e:
+        raise HTTPException(400, str(e))
+
+# Phase 2: stream directly (no cache)
+@app.get("/api/stream")
+async def stream_video(url: str, format_id: str):
+    """Stream video directly to browser."""
+    # Security: basic URL validation (just ensure it's not empty)
+    if not url.startswith(("http://", "https://")):
+        raise HTTPException(400, "Invalid URL")
+    # format_id: only alphanumeric, plus possibly + or - (yt-dlp format ids)
+    if not re.match(r'^[\w\+]+$', format_id):
+        raise HTTPException(400, "Invalid format_id")
+    cmd = ytdlp_base() + ["-f", format_id, "-o", "-", "--no-playlist", url]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    def generate():
+        while True:
+            chunk = proc.stdout.read(8192)
+            if not chunk:
+                break
+            yield chunk
+    return StreamingResponse(generate(), media_type="video/mp4",
+                            headers={"Content-Disposition": f"attachment; filename=video_{format_id}.mp4"})
+
+# Phase 3: download and cache (save to library)
+@app.post("/api/download-cache")
+async def api_download_cache(req: DownloadCacheRequest):
+    job_id = str(uuid.uuid4())
+    job_set(job_id, "running")
+    threading.Thread(target=download_and_cache_worker, args=(job_id, req.url, req.format_id), daemon=True).start()
+    return {"job_id": job_id}
+
+# Legacy check (optional, but used in UI for "exists" detection)
+@app.post("/api/check")
+async def api_check(req: UrlRequest):
+    job_id = str(uuid.uuid4())
+    job_set(job_id, "running")
+    threading.Thread(target=check_worker, args=(job_id, req.url), daemon=True).start()
+    return {"job_id": job_id}
+
+# Unified subtitle package (Phase 4)
+@app.post("/api/subtitle-package")
+async def api_subtitle_package(req: UrlRequest):
+    job_id = str(uuid.uuid4())
+    job_set(job_id, "running")
+    threading.Thread(target=subtitle_package_worker, args=(job_id, req.url), daemon=True).start()
+    return {"job_id": job_id}
+
+# Clipping
+@app.post("/api/cut")
+async def api_cut(req: CutRequest):
+    job_id = str(uuid.uuid4())
+    job_set(job_id, "running")
+    threading.Thread(target=cut_worker, args=(job_id, req.source_filename, req.ts_from, req.ts_to, req.mode), daemon=True).start()
+    return {"job_id": job_id}
+
+@app.post("/api/clip/convert-to-916/{filename}")
+async def api_convert_to_916(filename: str):
+    job_id = str(uuid.uuid4())
+    job_set(job_id, "running")
+    threading.Thread(target=convert_to_916_worker, args=(job_id, filename), daemon=True).start()
+    return {"job_id": job_id}
+
+@app.get("/api/job/{job_id}")
+async def api_job(job_id: str):
+    return JOBS.get(job_id, {"state": "not_found"})
+
+@app.get("/api/downloads/list")
+async def list_downloads():
+    videos = []
+    for f in sorted(DOWNLOADS.glob("*.mp4"), key=lambda p: p.stat().st_mtime, reverse=True):
+        stat = f.stat()
+        videos.append({
+            "filename": f.name,
+            "size_mb": round(stat.st_size / (1024 * 1024), 2),
+            "modified": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+        })
+    clips = []
+    for f in sorted(CLIPS.glob("*.mp4"), key=lambda p: p.stat().st_mtime, reverse=True):
+        stat = f.stat()
+        clips.append({
+            "filename": f.name,
+            "size_mb": round(stat.st_size / (1024 * 1024), 2),
+            "modified": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+        })
+    return {"videos": videos, "clips": clips}
+
+@app.delete("/api/clips/{filename}")
+async def delete_clip(filename: str):
+    filename = secure_filename(filename)
+    path = CLIPS / filename
+    if not path.exists():
+        raise HTTPException(404, "File not found")
+    path.unlink()
+    return {"message": f"Deleted {filename}"}
+
+@app.delete("/api/downloads/{filename}")
+async def delete_download(filename: str):
+    filename = secure_filename(filename)
+    path = DOWNLOADS / filename
+    if not path.exists():
+        raise HTTPException(404, "File not found")
+    path.unlink()
+    return {"message": f"Deleted {filename}"}
+
+@app.get("/api/download-file/video/{filename}")
+async def download_video(filename: str):
+    filename = secure_filename(filename)
+    path = DOWNLOADS / filename
+    if not path.exists():
+        raise HTTPException(404, "File not found")
+    return FileResponse(path, media_type="video/mp4", filename=filename)
+
+@app.get("/api/download-file/clip/{filename}")
+async def download_clip(filename: str):
+    filename = secure_filename(filename)
+    path = CLIPS / filename
+    if not path.exists():
+        raise HTTPException(404, "File not found")
+    return FileResponse(path, media_type="video/mp4", filename=filename)
 
 # ---------------------------------------------------------------------------
-# INLINE HTML (updated with check button and full integration like app-1)
+#  HTML
 # ---------------------------------------------------------------------------
 HTML = r"""<!DOCTYPE html>
 <html lang="en">
@@ -482,45 +636,43 @@ button:disabled{opacity:.35;cursor:not-allowed}
 @keyframes spin{0%{transform:translateX(-100%)}100%{transform:translateX(380%)}}
 .msg{font-size:11px;color:var(--muted);min-height:16px;line-height:1.5}
 .msg.ok{color:var(--ok)}.msg.err{color:var(--err)}
-
-/* Video info box */
-.vinfo{background:var(--surface2);border:1px solid var(--border);border-radius:10px;padding:14px;display:none;gap:12px}
+.vinfo{background:var(--surface2);border:1px solid var(--border);border-radius:10px;padding:14px;display:none;gap:12px;margin-bottom:12px}
 .vinfo.show{display:flex}
 .vinfo-thumb{width:100px;height:58px;object-fit:cover;border-radius:6px;background:var(--border);flex-shrink:0}
 .vinfo-body{flex:1;min-width:0}
 .vinfo-title{font-size:12px;font-weight:600;margin-bottom:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .vinfo-meta{font-size:10px;color:var(--muted);margin-bottom:8px}
-.vinfo-actions{display:flex;gap:6px;flex-wrap:wrap}
-
-/* Exists banner */
-.exists-banner{background:rgba(76,175,136,0.1);border:1px solid rgba(76,175,136,0.3);border-radius:8px;padding:10px 14px;font-size:11px;color:var(--ok);display:none;align-items:center;gap:8px}
-.exists-banner.show{display:flex}
-.exists-banner button{padding:5px 12px;font-size:11px}
-
+.format-table{width:100%;border-collapse:collapse;margin-top:12px}
+.format-table th,.format-table td{padding:8px 4px;text-align:left;border-top:1px solid var(--border)}
+.format-table th{font-size:10px;color:var(--muted);font-weight:500}
+.format-table button{padding:4px 12px;font-size:10px}
+.checkbox-row{display:flex;align-items:center;gap:10px;margin-top:8px}
+.checkbox-row label{font-size:12px;display:flex;align-items:center;gap:6px;cursor:pointer}
 .subtitle-box{background:var(--surface2);border:1px solid var(--border);border-radius:8px;margin-top:12px;padding:12px;position:relative}
 .subtitle-box .lbl{font-size:10px;margin-bottom:6px;display:flex;justify-content:space-between;align-items:center}
 .subtitle-box textarea{width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:10px;border-radius:6px;font-family:inherit;font-size:12px;resize:vertical}
 .copy-btn{background:var(--surface2);border:1px solid var(--border);padding:4px 10px;border-radius:6px;font-size:10px;cursor:pointer}
 .copy-btn:hover{background:var(--accent);color:#000}
-
 .file-list{display:flex;flex-direction:column;gap:8px;max-height:400px;overflow-y:auto}
 .file-item{background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:10px 14px;display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}
+.file-item.active{background:var(--surface3);border-color:var(--accent)}
 .file-info{flex:1;min-width:150px}
 .file-name{font-size:12px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .file-meta{font-size:10px;color:var(--muted);margin-top:3px}
 .file-actions{display:flex;gap:6px}
 .refresh-btn{background:var(--surface2);border:1px solid var(--border);padding:6px 12px;font-size:11px}
+.hint{font-size:11px;color:var(--muted);margin-bottom:8px}
+.info-box{background:var(--surface2);border-radius:8px;padding:12px;margin-top:12px}
 </style>
 </head>
 <body>
 <header>
   <h1>⬡ CLIPFORGE</h1>
-  <span class="badge">yt-dlp · FFmpeg · Subtitles</span>
+  <span class="badge">yt-dlp · FFmpeg · Metadata · Stream</span>
 </header>
 
 <div class="main">
-
-  <!-- CARD 1: VIDEO SOURCE -->
+  <!-- CARD 1: VIDEO SOURCE (REFACTORED) -->
   <div class="card">
     <div class="card-header">
       <div class="num">1</div>
@@ -531,35 +683,38 @@ button:disabled{opacity:.35;cursor:not-allowed}
         <label class="lbl">YouTube URL</label>
         <div class="row">
           <input type="text" id="url-input" placeholder="https://youtube.com/watch?v=..."/>
-          <button id="check-btn" onclick="startCheck()">Check</button>
+          <button id="analyze-btn" onclick="analyzeVideo()">Analyze</button>
         </div>
       </div>
       <div class="pw"><div class="pb" id="check-pb"></div></div>
       <div class="msg" id="check-msg"></div>
-
-      <div class="exists-banner" id="exists-banner">
-        <span>✓ Already downloaded</span>
-        <button class="sec" onclick="useExisting()">Use This Video</button>
-        <button class="warn-btn" onclick="forceDownload()">Re-download</button>
-      </div>
 
       <div class="vinfo" id="vinfo">
         <img class="vinfo-thumb" id="vinfo-thumb" src="" alt=""/>
         <div class="vinfo-body">
           <div class="vinfo-title" id="vinfo-title"></div>
           <div class="vinfo-meta" id="vinfo-meta"></div>
-          <div class="vinfo-actions">
-            <button id="dl-btn" onclick="startDownload()" style="display:none">⬇ Download Video</button>
-            <button class="warn-btn" onclick="fetchSubtitlesOnly()">📝 Subtitles Only</button>
-          </div>
         </div>
+      </div>
+
+      <div id="format-container" style="display:none"></div>
+
+      <div class="checkbox-row">
+        <label>
+          <input type="checkbox" id="cache-checkbox"/> 💾 Save to Library (cached)
+        </label>
+        <span style="font-size:10px; color:var(--muted)">Unchecked = stream directly (no disk usage)</span>
       </div>
 
       <div class="pw"><div class="pb" id="dl-pb"></div></div>
       <div class="msg" id="dl-msg"></div>
 
+      <div style="margin-top:8px">
+        <button class="sec" onclick="fetchSubtitlePackage()" style="width:100%">📝 Get Transcript & Segments (Package)</button>
+      </div>
+
       <div id="subtitle-area" style="display:none" class="subtitle-box">
-        <div class="lbl">📝 Transcript (English)
+        <div class="lbl">📄 Transcript & Segments
           <div style="display: flex; gap: 8px;">
             <button class="copy-btn" onclick="copyTranscript()">Copy Text</button>
             <button class="copy-btn" onclick="copySegments()">Copy Segments (JSON)</button>
@@ -601,9 +756,9 @@ button:disabled{opacity:.35;cursor:not-allowed}
       <div class="pw"><div class="pb" id="cut-pb"></div></div>
       <div class="msg" id="cut-msg"></div>
       <div class="info-box" id="cut-info" style="display:none">
-        <div class="vt" id="cut-title"></div>
-        <div class="vm" id="cut-mode" style="margin-top:4px"></div>
-        <div class="vm" id="cut-size" style="margin-top:2px"></div>
+        <div id="cut-title" style="font-size:12px;font-weight:500"></div>
+        <div id="cut-mode" style="font-size:11px;color:var(--muted);margin-top:4px"></div>
+        <div id="cut-size" style="font-size:11px;color:var(--muted);margin-top:2px"></div>
         <div style="margin-top:10px">
           <button class="ok-btn" id="cut-dl-btn" onclick="downloadClip()" disabled>⬇ Download Clip</button>
         </div>
@@ -640,11 +795,10 @@ button:disabled{opacity:.35;cursor:not-allowed}
       <div class="msg" id="export-msg"></div>
     </div>
   </div>
-
 </div>
 
 <script>
-// ── State ──────────────────────────────────────────────────────────────────
+// ── State ──────────────────────────────────────────────────────────────
 let state = {
   videoId: null,
   title: null,
@@ -655,10 +809,10 @@ let state = {
   clipFilename: null,
   subtitleText: '',
   subtitleSegments: [],
-  checkData: null,
+  formats: []
 };
 
-// Hardcoded JSON schema (transcript array is empty – will be replaced at runtime)
+// ── HARDCODED SCHEMA (FULL, FROM ORIGINAL) ─────────────────────────────
 const HARDCODED_SCHEMA = {
   "instruction_profile": {
     "system_instruction": "You are a short-form content strategist and clip intelligence engine. Your job is to analyze the provided transcript and produce a ranked list of clip blueprints, each conforming to the output schema defined below.",
@@ -730,12 +884,26 @@ const HARDCODED_SCHEMA = {
     }
   },
   "data_payload": {
-    "source_video_id": "vid_abc123xyz",
-    "transcript": []   // This will be replaced with state.subtitleSegments at export time
+    "source_video_id": "",
+    "transcript": []
   }
 };
 
-// ── Robust clipboard copy ─────────────────────────────────────────────────
+// ── Helper Functions ───────────────────────────────────────────────────
+function setMsg(id, cls, txt) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.className = 'msg' + (cls ? ' ' + cls : '');
+  el.textContent = txt;
+}
+function setPb(id, on) {
+  const pb = document.getElementById(id);
+  if (!pb) return;
+  on ? (pb.classList.add('spin'), pb.style.width = '35%') : (pb.classList.remove('spin'), pb.style.width = '0%');
+}
+function escapeHtml(s) {
+  return s.replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+}
 async function copyToClipboard(text, successMsg = '✓ Copied to clipboard') {
   try {
     await navigator.clipboard.writeText(text);
@@ -752,233 +920,187 @@ async function copyToClipboard(text, successMsg = '✓ Copied to clipboard') {
     setMsg('dl-msg', 'ok', successMsg);
   }
 }
-
-// ── Helpers ────────────────────────────────────────────────────────────────
-function setMsg(id, cls, txt) {
-  const el = document.getElementById(id);
-  el.className = 'msg' + (cls ? ' ' + cls : '');
-  el.textContent = txt;
-}
-function setPb(id, on) {
-  const pb = document.getElementById(id);
-  on ? (pb.classList.add('spin'), pb.style.width='35%') : (pb.classList.remove('spin'));
-}
-function escapeHtml(s) {
-  return s.replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
-}
-function poll(jid, pbId, msgId, onDone, onFail) {
+function poll(jobId, pbId, msgId, onDone, onFail) {
   setPb(pbId, true);
-  const iv = setInterval(async () => {
+  const interval = setInterval(async () => {
     try {
-      const d = await (await fetch('/api/job/' + jid)).json();
-      if (d.state === 'done') {
-        clearInterval(iv); setPb(pbId, false);
+      const res = await fetch('/api/job/' + jobId);
+      const data = await res.json();
+      if (data.state === 'done') {
+        clearInterval(interval);
+        setPb(pbId, false);
         document.getElementById(pbId).style.width = '100%';
-        onDone(d.data);
-      } else if (d.state === 'error') {
-        clearInterval(iv); setPb(pbId, false);
-        document.getElementById(pbId).style.width = '0%';
-        setMsg(msgId, 'err', '✗ ' + (d.error || 'error'));
+        onDone(data.data);
+      } else if (data.state === 'error') {
+        clearInterval(interval);
+        setPb(pbId, false);
+        setMsg(msgId, 'err', '✗ ' + (data.error || 'error'));
         if (onFail) onFail();
       }
-    } catch(e) {
-      clearInterval(iv); setPb(pbId, false);
+    } catch (e) {
+      clearInterval(interval);
+      setPb(pbId, false);
       setMsg(msgId, 'err', '✗ Network error');
+      if (onFail) onFail();
     }
   }, 900);
 }
-function showVinfo(data, showDlBtn) {
-  document.getElementById('vinfo-thumb').src = data.thumbnail || '';
-  document.getElementById('vinfo-title').textContent = data.title || '';
-  document.getElementById('vinfo-meta').textContent = 'Duration: ' + (data.duration_str || '') + (data.size_mb ? '  ·  ' + data.size_mb + ' MB' : '');
-  document.getElementById('vinfo').classList.add('show');
-  document.getElementById('dl-btn').style.display = showDlBtn ? '' : 'none';
-}
 
-// ── STEP 1a: CHECK ─────────────────────────────────────────────────────────
-async function startCheck() {
+// ── Phase 1: Analyze & Show Formats ────────────────────────────────────
+async function analyzeVideo() {
   const url = document.getElementById('url-input').value.trim();
   if (!url) return;
-  state = { ...state, videoId: null, title: null, filename: null, clipFilename: null, checkData: null };
-  document.getElementById('exists-banner').classList.remove('show');
+  setMsg('check-msg', '', 'Fetching formats...');
+  setPb('check-pb', true);
+  document.getElementById('format-container').style.display = 'none';
   document.getElementById('vinfo').classList.remove('show');
   document.getElementById('subtitle-area').style.display = 'none';
-  document.getElementById('cut-btn').disabled = true;
-  document.getElementById('dl-pb').style.width = '0%';
-  document.getElementById('check-pb').style.width = '0%';
-  setMsg('check-msg', '', 'Checking…');
-  setMsg('dl-msg', '', '');
-  document.getElementById('check-btn').disabled = true;
-  document.getElementById('export-schema-btn').disabled = true;
-  setMsg('export-msg', '', '');
   try {
-    const res = await fetch('/api/check', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({url}) });
-    const data = await res.json();
-    poll(data.job_id, 'check-pb', 'check-msg', (d) => {
-      document.getElementById('check-btn').disabled = false;
-      state.checkData = d;
-      state.videoId = d.video_id;
-      state.title = d.title;
-      state.durationStr = d.duration_str;
-      state.durationSec = d.duration_sec;
-      state.thumbnail = d.thumbnail;
-      if (d.exists) {
-        state.filename = d.filename;
-        setMsg('check-msg', 'ok', '✓ Found in library');
-        showVinfo({ ...d, size_mb: d.size_mb }, false);
-        document.getElementById('exists-banner').classList.add('show');
-        document.getElementById('cut-btn').disabled = false;
-        document.getElementById('cut-hint').textContent = 'Ready: ' + d.filename;
-      } else {
-        setMsg('check-msg', '', 'Not downloaded yet');
-        showVinfo(d, true);
-      }
-    }, () => { document.getElementById('check-btn').disabled = false; });
-  } catch(e) {
-    document.getElementById('check-btn').disabled = false;
-    setMsg('check-msg', 'err', '✗ Request failed');
-  }
-}
-function useExisting() {
-  document.getElementById('cut-btn').disabled = false;
-  document.getElementById('cut-hint').textContent = 'Ready: ' + (state.filename || '');
-  document.getElementById('exists-banner').classList.remove('show');
-  setMsg('check-msg', 'ok', '✓ Using existing: ' + state.filename);
-}
-function forceDownload() {
-  document.getElementById('exists-banner').classList.remove('show');
-  startDownload();
-}
-
-// ── STEP 1b: DOWNLOAD ──────────────────────────────────────────────────────
-async function startDownload() {
-  const url = document.getElementById('url-input').value.trim();
-  if (!url) { setMsg('dl-msg', 'err', '✗ Enter a URL first'); return; }
-  document.getElementById('dl-btn').disabled = true;
-  document.getElementById('dl-pb').style.width = '0%';
-  setMsg('dl-msg', '', 'Downloading video and subtitles...');
-  try {
-    const res = await fetch('/api/download', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url }) });
-    const data = await res.json();
-    poll(data.job_id, 'dl-pb', 'dl-msg', (d) => {
-      state.filename = d.filename;
-      state.subtitleText = d.subtitle_text || '';
-      setMsg('dl-msg', 'ok', `✓ Downloaded: ${d.filename} (${d.size_mb} MB)`);
-      showVinfo({ ...state, size_mb: d.size_mb }, false);
-      document.getElementById('cut-btn').disabled = false;
-      document.getElementById('cut-hint').textContent = 'Ready: ' + d.filename;
-      if (state.subtitleText) {
-        document.getElementById('subtitle-area').style.display = '';
-        document.getElementById('subtitle-text').value = state.subtitleText;
-      }
-      loadDownloadsList();
-    }, () => { document.getElementById('dl-btn').disabled = false; });
-  } catch(e) {
-    document.getElementById('dl-btn').disabled = false;
-    setMsg('dl-msg', 'err', '✗ Request failed');
-  }
-}
-
-// ── Subtitles only ─────────────────────────────────────────────────────────
-async function fetchSubtitlesOnly() {
-  const url = document.getElementById('url-input').value.trim();
-  if (!url) { setMsg('dl-msg', 'err', '✗ Enter a URL first'); return; }
-  setMsg('dl-msg', '', 'Fetching subtitles...');
-  document.getElementById('dl-pb').style.width = '0%';
-  try {
-    const res = await fetch('/api/subtitles-only', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({url}) });
-    const data = await res.json();
-    poll(data.job_id, 'dl-pb', 'dl-msg', (d) => {
-      state.subtitleText = d.subtitle_text || '';
-      setMsg('dl-msg', 'ok', `✓ Subtitles ready: ${d.title}`);
-      document.getElementById('subtitle-area').style.display = '';
-      document.getElementById('subtitle-text').value = state.subtitleText || '(none found)';
+    const res = await fetch('/api/formats', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url })
     });
-  } catch(e) { setMsg('dl-msg', 'err', '✗ Request failed'); }
+    if (!res.ok) throw new Error(await res.text());
+    const data = await res.json();
+    state.videoId = data.video_id;
+    state.title = data.title;
+    state.durationStr = data.duration_str;
+    state.thumbnail = data.thumbnail;
+    state.formats = data.formats;
+
+    document.getElementById('vinfo-thumb').src = data.thumbnail || '';
+    document.getElementById('vinfo-title').textContent = data.title || 'Untitled';
+    document.getElementById('vinfo-meta').textContent = 'Duration: ' + (data.duration_str || 'unknown');
+    document.getElementById('vinfo').classList.add('show');
+
+    let html = '<table class="format-table"><thead><tr><th>Quality</th><th>Format</th><th>Est. Size</th><th></th></tr></thead><tbody>';
+    for (let f of data.formats) {
+      const sizeText = f.size_mb ? f.size_mb + ' MB' : 'unknown';
+      html += `<tr>
+        <td>${f.resolution}</td>
+        <td>${f.ext}</td>
+        <td>${sizeText}</td>
+        <td><button onclick="startDownloadWithFormat('${f.format_id}')">Select</button></td>
+      </tr>`;
+    }
+    html += '</tbody></table>';
+    document.getElementById('format-container').innerHTML = html;
+    document.getElementById('format-container').style.display = 'block';
+    setMsg('check-msg', 'ok', `✓ ${data.formats.length} formats available`);
+  } catch (err) {
+    setMsg('check-msg', 'err', err.message);
+  } finally {
+    setPb('check-pb', false);
+  }
+}
+
+function startDownloadWithFormat(formatId) {
+  const url = document.getElementById('url-input').value.trim();
+  const cache = document.getElementById('cache-checkbox').checked;
+  if (cache) {
+    setMsg('dl-msg', '', `Downloading format ${formatId} & saving to library...`);
+    setPb('dl-pb', true);
+    fetch('/api/download-cache', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url, format_id: formatId })
+    })
+      .then(res => res.json())
+      .then(data => {
+        poll(data.job_id, 'dl-pb', 'dl-msg', (d) => {
+          state.filename = d.filename;
+          state.subtitleText = d.subtitle_text || '';
+          setMsg('dl-msg', 'ok', `✓ Saved: ${d.filename} (${d.size_mb} MB)`);
+          if (state.subtitleText) {
+            document.getElementById('subtitle-area').style.display = 'block';
+            document.getElementById('subtitle-text').value = state.subtitleText;
+          }
+          document.getElementById('cut-btn').disabled = false;
+          document.getElementById('cut-hint').textContent = 'Ready: ' + d.filename;
+          loadDownloadsList();
+        });
+      })
+      .catch(err => {
+        setPb('dl-pb', false);
+        setMsg('dl-msg', 'err', err.message);
+      });
+  } else {
+    window.location.href = `/api/stream?url=${encodeURIComponent(url)}&format_id=${formatId}`;
+  }
+}
+
+// ── Phase 4: Unified subtitle package ──────────────────────────────────
+async function fetchSubtitlePackage() {
+  const url = document.getElementById('url-input').value.trim();
+  if (!url) { setMsg('dl-msg', 'err', '✗ Enter a URL first'); return; }
+  setMsg('dl-msg', '', 'Fetching subtitles (plain text + segments)...');
+  setPb('dl-pb', true);
+  try {
+    const res = await fetch('/api/subtitle-package', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url })
+    });
+    const data = await res.json();
+    poll(data.job_id, 'dl-pb', 'dl-msg', (d) => {
+      state.subtitleText = d.plain_text || '';
+      state.subtitleSegments = d.segments || [];
+      document.getElementById('subtitle-area').style.display = 'block';
+      document.getElementById('subtitle-text').value = state.subtitleText || '(no transcript found)';
+      document.getElementById('export-schema-btn').disabled = false;
+      setMsg('dl-msg', 'ok', `✓ Got ${state.subtitleSegments.length} segments`);
+    });
+  } catch (err) {
+    setPb('dl-pb', false);
+    setMsg('dl-msg', 'err', err.message);
+  }
 }
 
 function copyTranscript() {
-  if (state.subtitleText) {
-    copyToClipboard(state.subtitleText, '✓ Transcript copied');
+  if (state.subtitleText) copyToClipboard(state.subtitleText, 'Transcript copied');
+  else setMsg('dl-msg', 'err', 'No transcript available');
+}
+
+function copySegments() {
+  if (state.subtitleSegments.length) {
+    copyToClipboard(JSON.stringify(state.subtitleSegments, null, 2), `${state.subtitleSegments.length} segments copied`);
   } else {
-    setMsg('dl-msg', 'err', '✗ No transcript available');
+    setMsg('dl-msg', 'err', 'No segments loaded');
   }
 }
 
-async function copySegments() {
-  if (state.subtitleSegments.length > 0) {
-    const jsonStr = JSON.stringify(state.subtitleSegments, null, 2);
-    copyToClipboard(jsonStr, `✓ ${state.subtitleSegments.length} segments copied`);
-    return;
-  }
-  const url = document.getElementById('url-input').value.trim();
-  if (!url) { setMsg('dl-msg', 'err', '✗ Enter a URL first'); return; }
-  setMsg('dl-msg', '', 'Fetching segments...');
-  try {
-    const res = await fetch('/api/subtitles-segments', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url }) });
-    const data = await res.json();
-    poll(data.job_id, 'dl-pb', 'dl-msg', (d) => {
-      state.subtitleSegments = d.segments || [];
-      const jsonStr = JSON.stringify(state.subtitleSegments, null, 2);
-      copyToClipboard(jsonStr, `✓ ${state.subtitleSegments.length} segments copied`);
-      document.getElementById('subtitle-text').value = jsonStr;
-      document.getElementById('export-schema-btn').disabled = false;
-    });
-  } catch(e) {
-    setMsg('dl-msg', 'err', '✗ Request failed');
-  }
-}
-
-async function exportSegmentsWithSchema() {
-  if (!state.subtitleSegments || state.subtitleSegments.length === 0) {
-    setMsg('export-msg', 'err', '✗ No segmented subtitles available. First fetch segments using "Copy Segments (JSON)" button.');
+function exportSegmentsWithSchema() {
+  if (!state.subtitleSegments.length) {
+    setMsg('export-msg', 'err', 'No segments to export');
     return;
   }
   const exportObj = JSON.parse(JSON.stringify(HARDCODED_SCHEMA));
   exportObj.data_payload.transcript = state.subtitleSegments;
-  if (state.videoId) exportObj.data_payload.source_video_id = state.videoId;
-  const jsonStr = JSON.stringify(exportObj, null, 2);
-  await copyToClipboard(jsonStr, '✓ Schema + segments copied to clipboard');
-  setMsg('export-msg', 'ok', `✓ Exported ${state.subtitleSegments.length} segments with schema`);
+  exportObj.data_payload.source_video_id = state.videoId || 'unknown';
+  copyToClipboard(JSON.stringify(exportObj, null, 2), '✓ Schema + segments copied');
 }
 
-// ── 9:16 conversion for clips ──────────────────────────────────────────────
-async function convertTo916(filename) {
-  if (!confirm(`Convert "${filename}" to 9:16 vertical format? A new file will be created.`)) return;
-  setMsg('dl-msg', '', `Converting ${filename}...`);
-  try {
-    const res = await fetch('/api/clip/convert-to-916/' + encodeURIComponent(filename), { method: 'POST' });
-    if (!res.ok) throw new Error(await res.text());
-    const data = await res.json();
-    poll(data.job_id, 'dl-pb', 'dl-msg', (d) => {
-      setMsg('dl-msg', 'ok', `✓ Converted: ${d.new_filename} (${d.size_mb} MB)`);
-      loadDownloadsList();
-    }, () => {
-      setMsg('dl-msg', 'err', '✗ Conversion failed');
-    });
-  } catch(e) {
-    console.error(e);
-    setMsg('dl-msg', 'err', '✗ Request failed: ' + e.message);
-  }
-}
-
-// ── STEP 2: CUT ────────────────────────────────────────────────────────────
+// ── Clipping (unchanged logic from original) ───────────────────────────
 async function startCut() {
   if (!state.filename) { setMsg('cut-msg', 'err', '✗ No video selected'); return; }
   const from = document.getElementById('ts-from').value.trim();
   const to = document.getElementById('ts-to').value.trim();
   if (!from || !to) { setMsg('cut-msg', 'err', '✗ Both timestamps required'); return; }
   const tsRe = /^\d{1,2}:\d{1,2}:\d{2}(?:\.\d{1,3})?$/;
-  if (!tsRe.test(from)) { setMsg('cut-msg', 'err', '✗ Invalid From timestamp'); return; }
-  if (!tsRe.test(to)) { setMsg('cut-msg', 'err', '✗ Invalid To timestamp'); return; }
+  if (!tsRe.test(from) || !tsRe.test(to)) { setMsg('cut-msg', 'err', '✗ Invalid timestamp format'); return; }
   const cutMode = document.querySelector('input[name="cut-mode"]:checked')?.value || 'normal';
   state.clipFilename = null;
   document.getElementById('cut-btn').disabled = true;
   document.getElementById('cut-info').style.display = 'none';
-  document.getElementById('cut-pb').style.width = '0%';
-  setMsg('cut-msg', '', cutMode === '9:16' ? 'Cutting and converting 9:16…' : 'Cutting clip…');
+  setMsg('cut-msg', '', cutMode === '9:16' ? 'Cutting & converting to 9:16...' : 'Cutting clip...');
+  setPb('cut-pb', true);
   try {
-    const res = await fetch('/api/cut', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ source_filename: state.filename, ts_from: from, ts_to: to, mode: cutMode }) });
+    const res = await fetch('/api/cut', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ source_filename: state.filename, ts_from: from, ts_to: to, mode: cutMode })
+    });
     const data = await res.json();
     poll(data.job_id, 'cut-pb', 'cut-msg', (d) => {
       state.clipFilename = d.clip_filename;
@@ -987,25 +1109,26 @@ async function startCut() {
       document.getElementById('cut-title').textContent = d.clip_filename;
       document.getElementById('cut-mode').textContent = 'Mode: ' + (d.mode === '9:16' ? '9:16 Vertical' : 'Original (stream copy)');
       document.getElementById('cut-size').textContent = 'Size: ' + (d.size_mb ? d.size_mb.toFixed(2) + ' MB' : 'unknown');
-      document.getElementById('cut-info').style.display = '';
+      document.getElementById('cut-info').style.display = 'block';
       document.getElementById('cut-dl-btn').disabled = false;
       loadDownloadsList();
-    }, () => { document.getElementById('cut-btn').disabled = false; });
-  } catch(e) {
+    });
+  } catch (err) {
     document.getElementById('cut-btn').disabled = false;
-    setMsg('cut-msg', 'err', '✗ Request failed');
+    setPb('cut-pb', false);
+    setMsg('cut-msg', 'err', err.message);
   }
 }
 function downloadClip() {
   if (state.clipFilename) window.location.href = '/api/download-file/clip/' + encodeURIComponent(state.clipFilename);
 }
 
-// ── Library interactions ───────────────────────────────────────────────────
+// ── Library functions ──────────────────────────────────────────────────
 function selectVideo(filename) {
   state.filename = filename;
   document.getElementById('cut-btn').disabled = false;
   document.getElementById('cut-hint').textContent = 'Ready: ' + filename;
-  setMsg('cut-msg', '', '');
+  setMsg('cut-msg', '');
   document.getElementById('cut-info').style.display = 'none';
   document.querySelectorAll('#downloads-list .file-item').forEach(el => {
     el.classList.toggle('active', el.dataset.fn === filename);
@@ -1029,12 +1152,27 @@ async function deleteFile(filename) {
   } catch(e) { setMsg('dl-msg', 'err', '✗ Delete request failed'); }
 }
 async function deleteClip(filename) {
-  if (!confirm(`Delete "${filename}"?`)) return;
+  if (!confirm(`Delete clip "${filename}"?`)) return;
   try {
     const res = await fetch('/api/clips/' + encodeURIComponent(filename), { method: 'DELETE' });
     if (res.ok) loadDownloadsList();
     else alert('Delete failed');
   } catch(e) { alert('Delete failed'); }
+}
+async function convertTo916(filename) {
+  if (!confirm(`Convert "${filename}" to 9:16 vertical? A new clip will be created.`)) return;
+  setMsg('dl-msg', '', `Converting ${filename}...`);
+  try {
+    const res = await fetch('/api/clip/convert-to-916/' + encodeURIComponent(filename), { method: 'POST' });
+    if (!res.ok) throw new Error(await res.text());
+    const data = await res.json();
+    poll(data.job_id, 'dl-pb', 'dl-msg', (d) => {
+      setMsg('dl-msg', 'ok', `✓ Converted: ${d.new_filename} (${d.size_mb} MB)`);
+      loadDownloadsList();
+    });
+  } catch(e) {
+    setMsg('dl-msg', 'err', 'Conversion failed: ' + e.message);
+  }
 }
 async function loadDownloadsList() {
   const videoContainer = document.getElementById('downloads-list');
@@ -1069,173 +1207,35 @@ async function loadDownloadsList() {
     if (!data.clips || !data.clips.length) {
       clipContainer.innerHTML = '<div class="msg">No clips yet.</div>';
     } else {
-      clipContainer.innerHTML = data.clips.map(f => {
-        const safeName = escapeHtml(f.filename);
-        const encodedName = encodeURIComponent(f.filename);
-        return `
-          <div class="file-item">
-            <div class="file-info">
-              <div class="file-name">${safeName}</div>
-              <div class="file-meta">${f.size_mb} MB · ${f.modified}</div>
-            </div>
-            <div class="file-actions">
-              <button class="sec" style="padding:5px 12px;border-radius:6px;" onclick="convertTo916('${safeName.replace(/'/g, "\\'")}')">9:16</button>
-              <a href="/api/download-file/clip/${encodedName}" class="sec" style="padding:5px 12px;border-radius:6px;text-decoration:none;color:var(--text);border:1px solid var(--border);">⬇ Download</a>
-              <button class="delete-btn" onclick="deleteClip('${safeName.replace(/'/g, "\\'")}')">🗑 Delete</button>
-            </div>
+      clipContainer.innerHTML = data.clips.map(f => `
+        <div class="file-item">
+          <div class="file-info">
+            <div class="file-name">${escapeHtml(f.filename)}</div>
+            <div class="file-meta">${f.size_mb} MB · ${f.modified}</div>
           </div>
-        `;
-      }).join('');
+          <div class="file-actions">
+            <button class="sec" style="padding:5px 12px;border-radius:6px;" onclick="convertTo916('${escapeHtml(f.filename)}')">9:16</button>
+            <a href="/api/download-file/clip/${encodeURIComponent(f.filename)}" class="sec" style="padding:5px 12px;border-radius:6px;text-decoration:none;color:var(--text);border:1px solid var(--border);">⬇ Download</a>
+            <button class="delete-btn" onclick="deleteClip('${escapeHtml(f.filename)}')">🗑 Delete</button>
+          </div>
+        </div>
+      `).join('');
     }
   } catch(e) {
-    console.error('Library load error:', e);
-    videoContainer.innerHTML = '<div class="msg err">Failed to load videos: ' + e.message + '</div>';
-    clipContainer.innerHTML = '<div class="msg err">Failed to load clips: ' + e.message + '</div>';
+    videoContainer.innerHTML = '<div class="msg err">Failed to load library</div>';
+    clipContainer.innerHTML = '<div class="msg err">Failed to load library</div>';
   }
 }
-document.getElementById('url-input').addEventListener('keydown', e => { if (e.key === 'Enter') startCheck(); });
+
+// ── Initial load & event binding ───────────────────────────────────────
+document.getElementById('url-input').addEventListener('keydown', e => { if (e.key === 'Enter') analyzeVideo(); });
 loadDownloadsList();
 </script>
 </body>
 </html>"""
 
-# ---------------------------------------------------------------------------
-# PYDANTIC MODELS
-# ---------------------------------------------------------------------------
-class CheckRequest(BaseModel):
-    url: str
 
-class DownloadRequest(BaseModel):
-    url: str
-
-class CutRequest(BaseModel):
-    source_filename: str
-    ts_from: str
-    ts_to: str
-    mode: str = "normal"
-
-    @validator('ts_from', 'ts_to')
-    def validate_timestamp(cls, v):
-        if not validate_timestamp(v):
-            raise ValueError(f"Invalid timestamp format: {v}. Use HH:MM:SS.mmm (e.g., 01:34:33.000)")
-        return v
-
-class SubtitleOnlyRequest(BaseModel):
-    url: str
-
-# ---------------------------------------------------------------------------
-# ROUTES
-# ---------------------------------------------------------------------------
 @app.get("/", response_class=HTMLResponse)
 async def index():
     return HTMLResponse(content=HTML)
 
-@app.post("/api/check")
-async def api_check(req: CheckRequest):
-    job_id = str(uuid.uuid4())
-    job_set(job_id, "running")
-    threading.Thread(target=check_worker, args=(job_id, req.url), daemon=True).start()
-    return {"job_id": job_id}
-
-@app.post("/api/download")
-async def api_download(req: DownloadRequest):
-    job_id = str(uuid.uuid4())
-    job_set(job_id, "running")
-    threading.Thread(target=download_worker, args=(job_id, req.url), daemon=True).start()
-    return {"job_id": job_id}
-
-@app.post("/api/subtitles-only")
-async def api_subtitles_only(req: SubtitleOnlyRequest):
-    job_id = str(uuid.uuid4())
-    job_set(job_id, "running")
-    threading.Thread(target=subtitle_only_worker, args=(job_id, req.url), daemon=True).start()
-    return {"job_id": job_id}
-
-@app.post("/api/subtitles-segments")
-async def api_subtitles_segments(req: SubtitleOnlyRequest):
-    job_id = str(uuid.uuid4())
-    job_set(job_id, "running")
-    threading.Thread(target=subtitle_segments_worker, args=(job_id, req.url), daemon=True).start()
-    return {"job_id": job_id}
-
-@app.post("/api/cut")
-async def api_cut(req: CutRequest):
-    job_id = str(uuid.uuid4())
-    job_set(job_id, "running")
-    threading.Thread(
-        target=cut_worker,
-        args=(job_id, req.source_filename, req.ts_from, req.ts_to, req.mode),
-        daemon=True
-    ).start()
-    return {"job_id": job_id}
-
-@app.get("/api/job/{job_id}")
-async def api_job(job_id: str):
-    return JOBS.get(job_id, {"state": "not_found"})
-
-@app.get("/api/downloads/list")
-async def list_downloads():
-    videos = []
-    for f in sorted(DOWNLOADS.glob("*.mp4"), key=lambda p: p.stat().st_mtime, reverse=True):
-        stat = f.stat()
-        videos.append({
-            "filename": f.name,
-            "size_mb": round(stat.st_size / (1024 * 1024), 2),
-            "modified": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
-        })
-    clips = []
-    for f in sorted(CLIPS.glob("*.mp4"), key=lambda p: p.stat().st_mtime, reverse=True):
-        stat = f.stat()
-        clips.append({
-            "filename": f.name,
-            "size_mb": round(stat.st_size / (1024 * 1024), 2),
-            "modified": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
-        })
-    return {"videos": videos, "clips": clips}
-
-@app.delete("/api/clips/{filename}")
-async def delete_clip(filename: str):
-    path = CLIPS / filename
-    if not path.exists():
-        raise HTTPException(404, "File not found")
-    path.unlink()
-    return {"message": f"Deleted {filename}"}
-
-@app.delete("/api/downloads/{filename}")
-async def delete_download(filename: str):
-    path = DOWNLOADS / filename
-    if not path.exists():
-        raise HTTPException(404, "File not found")
-    path.unlink()
-    return {"message": f"Deleted {filename}"}
-
-@app.get("/api/download-file/video/{filename}")
-async def download_video(filename: str):
-    path = DOWNLOADS / filename
-    if not path.exists():
-        raise HTTPException(404, "File not found")
-    return FileResponse(
-        str(path),
-        media_type="video/mp4",
-        filename=filename,
-        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{filename}"}
-    )
-
-@app.get("/api/download-file/clip/{filename}")
-async def download_clip(filename: str):
-    path = CLIPS / filename
-    if not path.exists():
-        raise HTTPException(404, "File not found")
-    return FileResponse(
-        str(path),
-        media_type="video/mp4",
-        filename=filename,
-        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{filename}"}
-    )
-
-@app.post("/api/clip/convert-to-916/{filename}")
-async def api_convert_to_916(filename: str):
-    job_id = str(uuid.uuid4())
-    job_set(job_id, "running")
-    threading.Thread(target=convert_to_916_worker, args=(job_id, filename), daemon=True).start()
-    return {"job_id": job_id}
