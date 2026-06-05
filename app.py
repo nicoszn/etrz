@@ -140,11 +140,18 @@ def get_video_metadata(url: str) -> dict:
     return json.loads(res.stdout.strip())
 
 def normalize_formats(metadata: dict) -> list:
-    """Extract useful formats with resolution and estimated size."""
+    """
+    Extract useful formats with resolution and estimated size.
+    Returns only ONE format per resolution (highest quality within that resolution,
+    preferring smaller file size when multiple exist).
+    """
+    from collections import defaultdict
+
     formats = metadata.get("formats", [])
-    video_formats = []
+    res_map = defaultdict(list)
+
     for f in formats:
-        # Must have video and audio, or at least video (best we can do)
+        # Must have both video and audio
         if f.get("vcodec") != "none" and f.get("acodec") != "none":
             height = f.get("height")
             if not height and "p" in f.get("format_note", ""):
@@ -154,20 +161,42 @@ def normalize_formats(metadata: dict) -> list:
                     height = None
             if height is None:
                 continue
+
+            # Estimate size (filesize or filesize_approx)
             size_mb = None
             if f.get("filesize"):
                 size_mb = round(f["filesize"] / (1024 * 1024), 1)
             elif f.get("filesize_approx"):
                 size_mb = round(f["filesize_approx"] / (1024 * 1024), 1)
-            video_formats.append({
+
+            # Skip formats with unknown size – they clutter the UI
+            if size_mb is None:
+                continue
+
+            res_map[height].append({
                 "format_id": f["format_id"],
                 "resolution": f"{height}p",
                 "ext": f.get("ext", "mp4"),
                 "size_mb": size_mb,
+                "quality_rank": f.get("quality", 0)  # fallback
             })
-    # Sort by resolution descending
-    video_formats.sort(key=lambda x: int(x["resolution"].rstrip("p")), reverse=True)
-    return video_formats
+
+    # For each resolution, keep the format with smallest file size (or best quality if tie)
+    unique_formats = []
+    for height, entries in res_map.items():
+        # Sort by size_mb ascending (smaller is better for user choice)
+        entries.sort(key=lambda x: x["size_mb"])
+        best = entries[0]
+        unique_formats.append({
+            "format_id": best["format_id"],
+            "resolution": best["resolution"],
+            "ext": best["ext"],
+            "size_mb": best["size_mb"]
+        })
+
+    # Sort by resolution descending (1080p, 720p, ...)
+    unique_formats.sort(key=lambda x: int(x["resolution"].rstrip("p")), reverse=True)
+    return unique_formats
 
 # ---------------------------------------------------------------------------
 # WORKERS (updated with format_id support)
