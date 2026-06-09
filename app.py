@@ -1059,7 +1059,7 @@ header {
   <div class="panel">
     <!-- Active Switching Tabs -->
     <div class="tabs">
-      <button class="tab-btn active" id="tabExtractor" onclick="switchTab('extractor')">URL Extractor</button>
+      <button class="tab-btn active" id="tabExtractor" onclick="switchTab('extractor')">Video Engine</button>
       <button class="tab-btn" id="tabMusic" onclick="switchTab('music')">Music Engine</button>
     </div>
 
