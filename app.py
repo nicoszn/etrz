@@ -1,6 +1,7 @@
 import re
 import json
 import uuid
+import time
 import subprocess
 import threading
 from pathlib import Path
@@ -17,9 +18,23 @@ TEMP.mkdir(exist_ok=True)
 
 app = FastAPI(title="YTE")
 JOBS = {}
+JOBS_LOCK = threading.Lock()
+JOB_TTL = 1800
 
 def job_set(job_id, state, data=None, error=None):
-    JOBS[job_id] = {"state": state, "data": data or {}, "error": error}
+    with JOBS_LOCK:
+        JOBS[job_id] = {"state": state, "data": data or {}, "error": error, "ts": time.time()}
+
+def _prune_jobs():
+    while True:
+        time.sleep(300)
+        cutoff = time.time() - JOB_TTL
+        with JOBS_LOCK:
+            stale = [k for k, v in JOBS.items() if v.get("ts", 0) < cutoff]
+            for k in stale:
+                del JOBS[k]
+
+threading.Thread(target=_prune_jobs, daemon=True).start()
 
 def seconds_to_ts(s: float) -> str:
     s = round(s, 3)
@@ -181,7 +196,8 @@ async def stream_video(url: str, format_id: str):
 
 @app.get("/api/job/{job_id}")
 async def api_job(job_id: str):
-    return JOBS.get(job_id, {"state": "not_found"})
+    with JOBS_LOCK:
+        return dict(JOBS.get(job_id, {"state": "not_found"}))
 
 HTML = r"""<!DOCTYPE html>
 <html lang="en">
@@ -583,6 +599,37 @@ header {
 @keyframes spin { to { transform: rotate(360deg); } }
 
 .pl-err { padding: 12px 20px 12px 106px; font-size: 0.68rem; color: var(--err); }
+
+.pl-sub-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 20px 12px 106px;
+  border-top: 1px solid var(--border);
+}
+
+.pl-sub-btn {
+  background: transparent;
+  border: 1px solid var(--border2);
+  color: var(--muted);
+  font-family: 'DM Mono', monospace;
+  font-size: 0.62rem;
+  letter-spacing: 0.06em;
+  padding: 5px 12px;
+  border-radius: 5px;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.pl-sub-btn:hover { border-color: var(--accent); color: var(--accent); background: var(--accent-dim); }
+
+.pl-copied {
+  font-size: 0.62rem;
+  color: var(--accent);
+  opacity: 0;
+  transition: opacity 0.3s;
+  letter-spacing: 0.06em;
+}
 </style>
 </head>
 <body>
@@ -784,7 +831,7 @@ function buildPlItem(v) {
     if (open && !loaded) {
       loaded = true;
       if (formatCache[v.id]) {
-        renderPlFormats(formatCache[v.id], formatsBox, v.url);
+        renderPlFormats(formatCache[v.id], formatsBox, v.url, formatCache[v.id + '_sub'] || null);
       } else {
         formatsBox.innerHTML = `<div class="pl-loading"><span class="spinner"></span>fetching formats...</div>`;
         try {
@@ -796,7 +843,10 @@ function buildPlItem(v) {
           if (!res.ok) throw new Error(await res.text());
           const data = await res.json();
           formatCache[v.id] = data.formats;
-          renderPlFormats(data.formats, formatsBox, v.url);
+          renderPlFormats(data.formats, formatsBox, v.url, null);
+          if (data.subtitle_job_id) {
+            pollPlSubtitle(data.subtitle_job_id, v.id, formatsBox);
+          }
         } catch (err) {
           formatsBox.innerHTML = `<div class="pl-err">${escHtml(err.message)}</div>`;
           loaded = false;
@@ -808,7 +858,7 @@ function buildPlItem(v) {
   return item;
 }
 
-function renderPlFormats(formats, container, videoUrl) {
+function renderPlFormats(formats, container, videoUrl, subtitleText) {
   let html = `<div class="pl-formats-header"><span>Resolution</span><span>Ext</span><span>Size</span><span></span></div>`;
   formats.forEach(f => {
     html += `<div class="pl-format-row">
@@ -818,7 +868,46 @@ function renderPlFormats(formats, container, videoUrl) {
       <button class="dl-btn" onclick="dlStream(${JSON.stringify(videoUrl)}, ${JSON.stringify(f.format_id)})">download</button>
     </div>`;
   });
+  html += `<div class="pl-sub-row">
+    <button class="pl-sub-btn" style="${subtitleText ? '' : 'display:none'}" onclick="copyPlSub(this, ${JSON.stringify(subtitleText || '')})">copy transcript</button>
+    <span class="pl-copied">copied</span>
+  </div>`;
   container.innerHTML = html;
+}
+
+function pollPlSubtitle(jobId, vidId, formatsBox) {
+  const timer = setInterval(async () => {
+    try {
+      const j = await fetch('/api/job/' + jobId).then(r => r.json());
+      if (j.state === 'done') {
+        clearInterval(timer);
+        if (j.data.subtitle_text) {
+          formatCache[vidId + '_sub'] = j.data.subtitle_text;
+          const subRow = formatsBox.querySelector('.pl-sub-row');
+          if (subRow) {
+            const btn = subRow.querySelector('.pl-sub-btn');
+            btn.setAttribute('onclick', `copyPlSub(this, ${JSON.stringify(j.data.subtitle_text)})`);
+            btn.style.display = '';
+          }
+        }
+      } else if (j.state === 'error') {
+        clearInterval(timer);
+      }
+    } catch { clearInterval(timer); }
+  }, 900);
+}
+
+async function copyPlSub(btn, text) {
+  if (!text) return;
+  try { await navigator.clipboard.writeText(text); }
+  catch {
+    const ta = document.createElement('textarea');
+    ta.value = text; document.body.appendChild(ta); ta.select();
+    document.execCommand('copy'); document.body.removeChild(ta);
+  }
+  const flash = btn.nextElementSibling;
+  flash.style.opacity = '1';
+  setTimeout(() => flash.style.opacity = '0', 1800);
 }
 
 function renderFormatRows(formats, container, videoUrl) {
