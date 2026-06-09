@@ -340,20 +340,32 @@ async def api_music_artist_search(q: str, limit: int = 5):
 async def api_music_artist_page(url: str, limit: int = 30):
     if not url.startswith(("http://", "https://")):
         raise HTTPException(400, "Invalid artist URL")
-    try:
-        target_url = url
-        # Point channel-specific URLs directly to the videos tab to prevent flat-playlist errors
-        if any(x in url for x in ["/channel/", "/user/", "/c/", "@"]):
-            parts = list(urllib.parse.urlparse(url))
-            path = parts[2].rstrip("/")
-            if not any(path.endswith(suffix) for suffix in ["/videos", "/releases", "/shorts", "/playlists", "/featured"]):
-                parts[2] = path + "/videos"
-                target_url = urllib.parse.urlunparse(parts)
+    
+    # We prioritize "/releases" to capture pure high-fidelity studio releases (Albums/EPs/Singles)
+    # over standard video uploads which might contain voiceovers, visual effects, and compression compromises.
+    target_url = url
+    if any(x in url for x in ["/channel/", "/user/", "/c/", "@"]):
+        parts = list(urllib.parse.urlparse(url))
+        path = parts[2].rstrip("/")
+        if not any(path.endswith(suffix) for suffix in ["/videos", "/releases", "/shorts", "/playlists", "/featured"]):
+            parts[2] = path + "/releases"
+            target_url = urllib.parse.urlunparse(parts)
 
+    try:
+        # Step 1: Try reading from the pure Studio Releases tab
         cmd = ytdlp_base() + [
             "--flat-playlist", "--dump-single-json", "--playlist-end", str(limit), "--no-warnings", target_url
         ]
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        
+        # Step 2: Fall back to "/playlists" or "/videos" if the artist has no Official Studio Release listings (e.g., smaller or non-OAC channels)
+        if res.returncode != 0 and "/releases" in target_url:
+            fallback_url = target_url.replace("/releases", "/videos")
+            cmd = ytdlp_base() + [
+                "--flat-playlist", "--dump-single-json", "--playlist-end", str(limit), "--no-warnings", fallback_url
+            ]
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+
         if res.returncode != 0:
             raise RuntimeError(res.stderr.strip())
 
@@ -372,10 +384,16 @@ async def api_music_artist_page(url: str, limit: int = 30):
                 "duration_str": seconds_to_ts(e.get("duration") or 0),
                 "url": e.get("url") or e.get("webpage_url") or f"https://www.youtube.com/watch?v={track_id}",
             })
+        
+        # Display context-aware descriptive header sub-text
+        is_pure = "/releases" in target_url and res.returncode == 0
+        desc_label = "Official Studio Master Releases" if is_pure else "Latest Uploaded Releases"
+
         return {
             "artist_name": data.get("title") or "Artist Page",
             "count": len(tracks),
-            "tracks": tracks
+            "tracks": tracks,
+            "description": desc_label
         }
     except Exception as e:
         raise HTTPException(400, str(e))
@@ -1459,7 +1477,7 @@ async function openArtistPage(url) {
       <div class="artist-header-info">
         <div class="artist-info">
           <div class="meta-title" style="font-size: 1.1rem; line-height: 1;">${escHtml(data.artist_name)}</div>
-          <div class="meta-duration" style="margin-top: 4px;">Latest ${data.count} Studio Releases</div>
+          <div class="meta-duration" style="margin-top: 4px;">${escHtml(data.description || 'Studio Releases')} (${data.count} items)</div>
         </div>
       </div>
     `;
@@ -1755,9 +1773,5 @@ document.getElementById('musicQuery').addEventListener('keydown', e => {
 </script>
 </body>
 </html>"""
-
-@app.get("/", response_class=HTMLResponse)
-async def index():
-    return HTMLResponse(content=HTML)
 
 ```
