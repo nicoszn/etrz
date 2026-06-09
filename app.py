@@ -5,12 +5,20 @@ import time
 import subprocess
 import threading
 import urllib.parse
+import logging
 from pathlib import Path
 from collections import defaultdict
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
+
+# Setup logging
+logging.basicConfig(
+    level=logging.ERROR,
+    format="%(asctime)s [%(levelname)s] %(name)s - %(message)s"
+)
+logger = logging.getLogger("yte")
 
 BASE_DIR = Path(__file__).parent
 COOKIES = BASE_DIR / "cookies.txt"
@@ -117,7 +125,8 @@ def subtitle_worker(job_id, url):
         vtt_path.unlink(missing_ok=True)
         job_set(job_id, "done", {"subtitle_text": sub_text})
     except Exception as ex:
-        job_set(job_id, "error", error=str(ex))
+        logger.error(f"Subtitle worker failed for {url}", exc_info=True)
+        job_set(job_id, "error", error="Subtitle extraction failed, please try again.")
 
 class UrlRequest(BaseModel):
     url: str
@@ -125,9 +134,16 @@ class UrlRequest(BaseModel):
 def is_playlist_url(url: str) -> bool:
     return "list=" in url and "watch?v=" not in url
 
+def is_channel_url(url: str) -> bool:
+    return any(x in url for x in ["/channel/", "/user/", "/c/", "/@"]) and "watch?v=" not in url
+
 @app.post("/api/detect")
 async def api_detect(req: UrlRequest):
-    return {"is_playlist": is_playlist_url(req.url)}
+    url = req.url.strip()
+    return {
+        "is_playlist": is_playlist_url(url),
+        "is_channel": is_channel_url(url)
+    }
 
 @app.post("/api/playlist")
 async def api_playlist(req: UrlRequest):
@@ -157,7 +173,66 @@ async def api_playlist(req: UrlRequest):
             "videos": videos
         }
     except Exception as e:
-        raise HTTPException(400, str(e))
+        logger.error(f"Playlist extraction failed: {req.url}", exc_info=True)
+        raise HTTPException(400, "Unable to fetch playlist, please try again later.")
+
+@app.post("/api/channel")
+async def api_channel(req: UrlRequest, tab: str = "videos"):
+    try:
+        url = req.url.strip()
+        # Clean any appended tabs to prevent double-concatenation
+        for suffix in ["/videos", "/shorts", "/live", "/playlists", "/releases", "/featured"]:
+            if url.endswith(suffix):
+                url = url[:-len(suffix)]
+        url = url.rstrip("/")
+        
+        target_url = url
+        if tab != "featured":
+            target_url = f"{url}/{tab}"
+            
+        cmd = ytdlp_base() + [
+            "--flat-playlist", "--dump-single-json", "--playlist-end", "50", "--no-warnings", target_url
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        
+        # Fallback to the channel base URL if the requested tab doesn't exist
+        if res.returncode != 0 and tab != "featured":
+            cmd = ytdlp_base() + [
+                "--flat-playlist", "--dump-single-json", "--playlist-end", "50", "--no-warnings", url
+            ]
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            
+        if res.returncode != 0:
+            raise RuntimeError(res.stderr.strip())
+            
+        data = json.loads(res.stdout.strip())
+        entries = data.get("entries", [])
+        items = []
+        for i, e in enumerate(entries):
+            if not e:
+                continue
+            vid_id = e.get("id") or e.get("url", "").split("v=")[-1]
+            is_pl = e.get("_type") == "playlist" or "list=" in e.get("url", "") or "playlist?list=" in e.get("url", "")
+            items.append({
+                "index": i,
+                "id": vid_id,
+                "title": e.get("title") or f"Item {i+1}",
+                "thumbnail": e.get("thumbnail") or (f"https://i.ytimg.com/vi/{vid_id}/mqdefault.jpg" if vid_id else None),
+                "duration_str": seconds_to_ts(e.get("duration") or 0) if not is_pl else "Playlist",
+                "url": e.get("url") or e.get("webpage_url") or f"https://www.youtube.com/watch?v={vid_id}",
+                "is_playlist": is_pl
+            })
+            
+        return {
+            "channel_title": data.get("title") or "Channel Feed",
+            "channel_url": url,
+            "tab": tab,
+            "count": len(items),
+            "items": items
+        }
+    except Exception as e:
+        logger.error(f"Channel extraction failed: {req.url} (tab={tab})", exc_info=True)
+        raise HTTPException(400, "Unable to fetch channel content, please try again later.")
 
 @app.post("/api/formats")
 async def api_formats(req: UrlRequest):
@@ -176,7 +251,8 @@ async def api_formats(req: UrlRequest):
             "subtitle_job_id": job_id
         }
     except Exception as e:
-        raise HTTPException(400, str(e))
+        logger.error(f"Format extraction failed: {req.url}", exc_info=True)
+        raise HTTPException(400, "Unable to get video formats, please try again later.")
 
 @app.get("/api/stream")
 async def stream_video(url: str, format_id: str):
@@ -184,8 +260,13 @@ async def stream_video(url: str, format_id: str):
         raise HTTPException(400, "Invalid URL")
     if not re.match(r'^[\w\+]+$', format_id):
         raise HTTPException(400, "Invalid format_id")
-    cmd = ytdlp_base() + ["-f", format_id, "-o", "-", "--no-playlist", url]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        cmd = ytdlp_base() + ["-f", format_id, "-o", "-", "--no-playlist", url]
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except Exception as e:
+        logger.error(f"Stream process start failed: {url} / {format_id}", exc_info=True)
+        raise HTTPException(400, "Could not start stream, please try again later.")
+
     def generate():
         while True:
             chunk = proc.stdout.read(8192)
@@ -236,15 +317,19 @@ async def api_music_search(q: str, limit: int = 10):
             })
         return {"results": results}
     except Exception as e:
-        raise HTTPException(400, str(e))
+        logger.error(f"Music search failed: q={q}", exc_info=True)
+        raise HTTPException(400, "Music search failed, please try again later.")
 
 @app.get("/api/music/preview")
 async def api_music_preview(url: str):
     if not url.startswith(("http://", "https://")):
         raise HTTPException(400, "Invalid URL")
-
-    cmd = ytdlp_base() + ["-f", "ba", "--download-sections", "*00:00-00:30", "-o", "-", "--no-playlist", url]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        cmd = ytdlp_base() + ["-f", "ba", "--download-sections", "*00:00-00:30", "-o", "-", "--no-playlist", url]
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except Exception as e:
+        logger.error(f"Preview stream start failed: {url}", exc_info=True)
+        raise HTTPException(400, "Could not start preview, please try again later.")
 
     def generate():
         try:
@@ -255,6 +340,7 @@ async def api_music_preview(url: str):
                 yield chunk
         finally:
             proc.terminate()
+            proc.wait()
 
     return StreamingResponse(generate(), media_type="audio/mp4")
 
@@ -267,7 +353,8 @@ async def api_music_download(url: str, format: str = "mp3"):
         meta = get_video_metadata(url)
         title = meta.get("title", "audio_track")
         safe_title = re.sub(r'[^\w\s-]', '', title).strip().replace(' ', '_')
-    except Exception:
+    except Exception as e:
+        logger.error(f"Metadata fetch for download failed: {url}", exc_info=True)
         safe_title = "audio_track"
 
     cmd = ytdlp_base()
@@ -280,7 +367,11 @@ async def api_music_download(url: str, format: str = "mp3"):
         filename = f"{safe_title}.m4a"
         media_type = "audio/mp4"
 
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except Exception as e:
+        logger.error(f"Download process start failed: {url}", exc_info=True)
+        raise HTTPException(400, "Could not start download, please try again later.")
 
     def generate():
         try:
@@ -291,6 +382,7 @@ async def api_music_download(url: str, format: str = "mp3"):
                 yield chunk
         finally:
             proc.terminate()
+            proc.wait()
 
     return StreamingResponse(
         generate(),
@@ -333,26 +425,39 @@ async def api_music_artist_search(q: str, limit: int = 5):
             })
         return {"artists": artists}
     except Exception as e:
-        raise HTTPException(400, str(e))
+        logger.error(f"Artist search failed: q={q}", exc_info=True)
+        raise HTTPException(400, "Artist search failed, please try again later.")
 
 @app.get("/api/music/artist/page")
 async def api_music_artist_page(url: str, limit: int = 30):
     if not url.startswith(("http://", "https://")):
         raise HTTPException(400, "Invalid artist URL")
-    try:
-        target_url = url
-        # Point channel-specific URLs directly to the videos tab to prevent flat-playlist errors
-        if any(x in url for x in ["/channel/", "/user/", "/c/", "@"]):
-            parts = list(urllib.parse.urlparse(url))
-            path = parts[2].rstrip("/")
-            if not any(path.endswith(suffix) for suffix in ["/videos", "/releases", "/shorts", "/playlists", "/featured"]):
-                parts[2] = path + "/videos"
-                target_url = urllib.parse.urlunparse(parts)
+    
+    # We prioritize "/releases" to capture pure high-fidelity studio releases (Albums/EPs/Singles)
+    # over standard video uploads which might contain voiceovers, visual effects, and compression compromises.
+    target_url = url
+    if any(x in url for x in ["/channel/", "/user/", "/c/", "@"]):
+        parts = list(urllib.parse.urlparse(url))
+        path = parts[2].rstrip("/")
+        if not any(path.endswith(suffix) for suffix in ["/videos", "/releases", "/shorts", "/playlists", "/featured"]):
+            parts[2] = path + "/releases"
+            target_url = urllib.parse.urlunparse(parts)
 
+    try:
+        # Step 1: Try reading from the pure Studio Releases tab
         cmd = ytdlp_base() + [
             "--flat-playlist", "--dump-single-json", "--playlist-end", str(limit), "--no-warnings", target_url
         ]
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        
+        # Step 2: Fall back to "/playlists" or "/videos" if the artist has no Official Studio Release listings (e.g., smaller or non-OAC channels)
+        if res.returncode != 0 and "/releases" in target_url:
+            fallback_url = target_url.replace("/releases", "/videos")
+            cmd = ytdlp_base() + [
+                "--flat-playlist", "--dump-single-json", "--playlist-end", str(limit), "--no-warnings", fallback_url
+            ]
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+
         if res.returncode != 0:
             raise RuntimeError(res.stderr.strip())
 
@@ -371,13 +476,20 @@ async def api_music_artist_page(url: str, limit: int = 30):
                 "duration_str": seconds_to_ts(e.get("duration") or 0),
                 "url": e.get("url") or e.get("webpage_url") or f"https://www.youtube.com/watch?v={track_id}",
             })
+        
+        # Display context-aware descriptive header sub-text
+        is_pure = "/releases" in target_url and res.returncode == 0
+        desc_label = "Official Studio Master Releases" if is_pure else "Latest Uploaded Releases"
+
         return {
             "artist_name": data.get("title") or "Artist Page",
             "count": len(tracks),
-            "tracks": tracks
+            "tracks": tracks,
+            "description": desc_label
         }
     except Exception as e:
-        raise HTTPException(400, str(e))
+        logger.error(f"Artist page fetch failed: {url}", exc_info=True)
+        raise HTTPException(400, "Could not fetch artist releases, please try again later.")
 
 @app.get("/api/music/link")
 async def api_music_link(url: str):
@@ -424,7 +536,8 @@ async def api_music_link(url: str):
             }
             return {"results": [track], "title": meta.get("title", "Track")}
     except Exception as e:
-        raise HTTPException(400, str(e))
+        logger.error(f"Music link processing failed: {url}", exc_info=True)
+        raise HTTPException(400, "Could not process the music link, please try again later.")
 
 
 HTML = r"""<!DOCTYPE html>
@@ -1105,6 +1218,73 @@ header {
   color: var(--accent);
   background: var(--accent-dim);
 }
+
+/* ==========================================
+   NEW ROBUST VIDEO CHANNEL SYSTEM STYLING
+   ========================================== */
+
+.channel-header {
+  display: none;
+  padding: 16px 20px;
+  border-top: 1px solid var(--border);
+  gap: 10px;
+  align-items: baseline;
+}
+
+.channel-header.visible { display: flex; }
+
+.channel-title {
+  font-family: 'Syne', sans-serif;
+  font-weight: 700;
+  font-size: 0.82rem;
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.channel-count { font-size: 0.65rem; color: var(--muted); letter-spacing: 0.06em; flex-shrink: 0; }
+
+.channel-tabs {
+  display: none;
+  border-top: 1px solid var(--border);
+  background: rgba(0, 0, 0, 0.15);
+}
+
+.channel-tabs.visible { display: flex; }
+
+.ch-tab-btn {
+  flex: 1;
+  background: transparent;
+  border: none;
+  color: var(--muted);
+  font-family: 'Syne', sans-serif;
+  font-weight: 600;
+  font-size: 0.65rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  padding: 12px;
+  cursor: pointer;
+  transition: all 0.15s;
+  border-bottom: 2px solid transparent;
+}
+
+.ch-tab-btn:hover {
+  color: var(--text);
+}
+
+.ch-tab-btn.active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+  background: rgba(200, 255, 87, 0.02);
+}
+
+.channel-list {
+  display: none;
+  border-top: 1px solid var(--border);
+}
+
+.channel-list.visible { display: block; }
 </style>
 </head>
 <body>
@@ -1124,7 +1304,7 @@ header {
     <!-- Mode 1: URL Extractor Section -->
     <div id="extractorView">
       <div class="input-row">
-        <input class="url-input" id="url" type="text" placeholder="paste youtube url or playlist" autocomplete="off" spellcheck="false" />
+        <input class="url-input" id="url" type="text" placeholder="paste youtube url, playlist, or channel" autocomplete="off" spellcheck="false" />
         <button class="run-btn" id="runBtn" onclick="run()">Run</button>
       </div>
     </div>
@@ -1181,6 +1361,19 @@ header {
     </div>
 
     <div class="playlist-list" id="plList"></div>
+
+    <!-- Expanded Channel Layout Ports -->
+    <div class="channel-header" id="chHeader">
+      <span class="channel-title" id="chTitle"></span>
+      <span class="channel-count" id="chCount"></span>
+    </div>
+    <div class="channel-tabs" id="chTabs">
+      <button class="ch-tab-btn active" onclick="switchChannelTab('videos')">Videos</button>
+      <button class="ch-tab-btn" onclick="switchChannelTab('shorts')">Shorts</button>
+      <button class="ch-tab-btn" onclick="switchChannelTab('live')">Live</button>
+      <button class="ch-tab-btn" onclick="switchChannelTab('playlists')">Playlists</button>
+    </div>
+    <div class="channel-list" id="chList"></div>
   </div>
 </div>
 
@@ -1190,6 +1383,10 @@ let _subtitlePollTimer = null;
 let _subtitleText = "";
 let _activeTab = "extractor";
 let _musicFilter = "tracks";
+
+// Global Channel extraction pointers
+let _currentChannelUrl = "";
+let _currentChannelTab = "videos";
 
 // Live Preview audio control context
 let _previewAudio = new Audio();
@@ -1223,6 +1420,15 @@ function resetAll() {
   document.getElementById('plHeader').className = 'playlist-header';
   document.getElementById('plList').className = 'playlist-list';
   document.getElementById('plList').innerHTML = '';
+
+  // Clean layout variables for Channel extraction ports
+  document.getElementById('chHeader').classList.remove('visible');
+  document.getElementById('chHeader').style.display = 'none';
+  document.getElementById('chTabs').classList.remove('visible');
+  document.getElementById('chTabs').style.display = 'none';
+  document.getElementById('chList').classList.remove('visible');
+  document.getElementById('chList').style.display = 'none';
+  document.getElementById('chList').innerHTML = '';
 
   // Cleanly clear and halt any running preview cut
   _previewAudio.pause();
@@ -1458,7 +1664,7 @@ async function openArtistPage(url) {
       <div class="artist-header-info">
         <div class="artist-info">
           <div class="meta-title" style="font-size: 1.1rem; line-height: 1;">${escHtml(data.artist_name)}</div>
-          <div class="meta-duration" style="margin-top: 4px;">Latest ${data.count} Studio Releases</div>
+          <div class="meta-duration" style="margin-top: 4px;">${escHtml(data.description || 'Studio Releases')} (${data.count} items)</div>
         </div>
       </div>
     `;
@@ -1520,7 +1726,9 @@ async function run() {
       body: JSON.stringify({ url })
     }).then(r => r.json());
 
-    if (det.is_playlist) {
+    if (det.is_channel) {
+      await loadChannel(url, 'videos');
+    } else if (det.is_playlist) {
       await loadPlaylist(url);
     } else {
       await loadSingle(url);
@@ -1530,6 +1738,132 @@ async function run() {
   } finally {
     setLoading(false);
   }
+}
+
+async function loadChannel(url, tab) {
+  _currentChannelUrl = url;
+  _currentChannelTab = tab;
+  setStatus('', `fetching channel ${tab} feed...`);
+
+  const tabs = document.querySelectorAll('.ch-tab-btn');
+  tabs.forEach(btn => {
+    const normalizedText = btn.textContent.trim().toLowerCase();
+    btn.classList.toggle('active', normalizedText === tab);
+  });
+
+  try {
+    const res = await fetch(`/api/channel?tab=${tab}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url })
+    });
+    if (!res.ok) throw new Error(await res.text());
+    const data = await res.json();
+
+    document.getElementById('chTitle').textContent = data.channel_title || 'Channel';
+    document.getElementById('chCount').textContent = `${data.count} items`;
+    document.getElementById('chHeader').classList.add('visible');
+    document.getElementById('chHeader').style.display = 'flex';
+    document.getElementById('chTabs').classList.add('visible');
+    document.getElementById('chTabs').style.display = 'flex';
+
+    const list = document.getElementById('chList');
+    list.innerHTML = '';
+    list.classList.add('visible');
+    list.style.display = 'block';
+
+    if (data.items.length === 0) {
+      list.innerHTML = `<div class="status">No content listed under this tab.</div>`;
+    } else {
+      data.items.forEach(item => {
+        list.appendChild(buildChItem(item));
+      });
+    }
+    setStatus('ok', `loaded channel tab ${tab}`);
+  } catch (err) {
+    setStatus('err', err.message);
+  }
+}
+
+function switchChannelTab(tab) {
+  if (!_currentChannelUrl) return;
+  loadChannel(_currentChannelUrl, tab);
+}
+
+function buildChItem(v) {
+  const item = document.createElement('div');
+  item.className = 'pl-item';
+
+  const row = document.createElement('div');
+  row.className = 'pl-row';
+  
+  const badgeHtml = v.is_playlist
+    ? `<span class="res-badge" style="color:var(--accent); font-size:0.58rem; border:1px solid var(--accent); padding:2px 6px; border-radius:3px;">PLAYLIST</span>`
+    : `<span class="pl-dur">${v.duration_str || ''}</span>`;
+
+  row.innerHTML = `
+    <img class="pl-thumb" src="${v.thumbnail || ''}" alt="" loading="lazy" />
+    <div class="pl-info">
+      <div class="pl-title">${escHtml(v.title)}</div>
+      <div style="margin-top: 4px; display: flex; align-items: center; gap: 8px;">
+        ${badgeHtml}
+      </div>
+    </div>
+    <svg class="pl-chevron" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+      <path d="M4 6l4 4 4-4"/>
+    </svg>
+  `;
+
+  const formatsBox = document.createElement('div');
+  formatsBox.className = 'pl-formats';
+  item.appendChild(row);
+  item.appendChild(formatsBox);
+
+  if (v.is_playlist) {
+    // Treat playlists inside tabs as actionable anchors that load directly into the main search flow
+    row.querySelector('.pl-chevron').innerHTML = '<path d="M6 12l4-4-4-4"/>';
+    row.addEventListener('click', () => {
+      document.getElementById('url').value = v.url;
+      run();
+    });
+  } else {
+    let loaded = false;
+    let open = false;
+
+    row.addEventListener('click', async () => {
+      open = !open;
+      row.classList.toggle('open', open);
+      formatsBox.classList.toggle('visible', open);
+
+      if (open && !loaded) {
+        loaded = true;
+        if (formatCache[v.id]) {
+          renderPlFormats(formatCache[v.id], formatsBox, v.url, formatCache[v.id + '_sub'] || null);
+        } else {
+          formatsBox.innerHTML = `<div class="pl-loading"><span class="spinner"></span>fetching formats...</div>`;
+          try {
+            const res = await fetch('/api/formats', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ url: v.url })
+            });
+            if (!res.ok) throw new Error(await res.text());
+            const data = await res.json();
+            formatCache[v.id] = data.formats;
+            renderPlFormats(data.formats, formatsBox, v.url, null);
+            if (data.subtitle_job_id) {
+              pollPlSubtitle(data.subtitle_job_id, v.id, formatsBox);
+            }
+          } catch (err) {
+            formatsBox.innerHTML = `<div class="pl-err">${escHtml(err.message)}</div>`;
+            loaded = false;
+          }
+        }
+      }
+    });
+  }
+
+  return item;
 }
 
 async function loadSingle(url) {
@@ -1753,8 +2087,9 @@ document.getElementById('musicQuery').addEventListener('keydown', e => {
 });
 </script>
 </body>
-</html>"""
+</html>
 
+"""
 @app.get("/", response_class=HTMLResponse)
-async def index():
-    return HTMLResponse(content=HTML)
+async def root():
+    return HTML
