@@ -5,6 +5,7 @@ import uuid
 import time
 import subprocess
 import threading
+import urllib.parse
 from pathlib import Path
 from collections import defaultdict
 
@@ -210,8 +211,6 @@ async def api_music_search(q: str, limit: int = 10):
     if not q:
         raise HTTPException(400, "Search query is required")
     try:
-        # Appending "official audio" or "topic" ensures we hit the studio release versions.
-        # This filters out cinematic music videos with sirens/talking/effects.
         optimized_query = f"{q} official audio"
         search_query = f"ytsearch{limit}:{optimized_query}"
         
@@ -245,7 +244,6 @@ async def api_music_preview(url: str):
     if not url.startswith(("http://", "https://")):
         raise HTTPException(400, "Invalid URL")
     
-    # Use yt-dlp section download to slice out a high performance 30-second audio track
     cmd = ytdlp_base() + ["-f", "ba", "--download-sections", "*00:00-00:30", "-o", "-", "--no-playlist", url]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     
@@ -266,7 +264,6 @@ async def api_music_download(url: str, format: str = "mp3"):
     if not url.startswith(("http://", "https://")):
         raise HTTPException(400, "Invalid URL")
     
-    # Pre-fetch meta details to retrieve a clean safe file title
     try:
         meta = get_video_metadata(url)
         title = meta.get("title", "audio_track")
@@ -276,12 +273,10 @@ async def api_music_download(url: str, format: str = "mp3"):
 
     cmd = ytdlp_base()
     if format.lower() == "mp3":
-        # Extract audio and pipe straight through to output as converted mp3 file (requires ffmpeg)
         cmd += ["-f", "ba", "-x", "--audio-format", "mp3", "-o", "-", "--no-playlist", url]
         filename = f"{safe_title}.mp3"
         media_type = "audio/mpeg"
     else:
-        # Native direct stream without on-the-fly ffmpeg conversion requirement (high fallback compatibility)
         cmd += ["-f", "ba", "-o", "-", "--no-playlist", url]
         filename = f"{safe_title}.m4a"
         media_type = "audio/mp4"
@@ -303,6 +298,76 @@ async def api_music_download(url: str, format: str = "mp3"):
         media_type=media_type,
         headers={"Content-Disposition": f"attachment; filename={filename}"}
     )
+
+
+# ==========================================
+# ARTIST SEARCH & NAVIGATIONAL PAGE APIS
+# ==========================================
+
+@app.get("/api/music/artist/search")
+async def api_music_artist_search(q: str, limit: int = 5):
+    if not q:
+        raise HTTPException(400, "Artist search query is required")
+    try:
+        encoded_q = urllib.parse.quote_plus(q)
+        search_url = f"https://www.youtube.com/results?search_query={encoded_q}&sp=EgIQAg%253D%253D"
+        
+        cmd = ytdlp_base() + [
+            "--flat-playlist", "--dump-single-json", "--playlist-end", str(limit), "--no-warnings", search_url
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        if res.returncode != 0:
+            raise RuntimeError(res.stderr.strip())
+        
+        data = json.loads(res.stdout.strip())
+        entries = data.get("entries", [])
+        artists = []
+        for e in entries:
+            artist_id = e.get("id")
+            if not artist_id:
+                continue
+            artists.append({
+                "id": artist_id,
+                "name": e.get("title") or "Unknown Artist",
+                "thumbnail": e.get("thumbnail") or f"https://i.ytimg.com/vi/{artist_id}/mqdefault.jpg",
+                "channel_url": e.get("url") or f"https://www.youtube.com/channel/{artist_id}"
+            })
+        return {"artists": artists}
+    except Exception as e:
+        raise HTTPException(400, str(e))
+
+@app.get("/api/music/artist/page")
+async def api_music_artist_page(url: str, limit: int = 30):
+    if not url.startswith(("http://", "https://")):
+        raise HTTPException(400, "Invalid artist URL")
+    try:
+        cmd = ytdlp_base() + [
+            "--flat-playlist", "--dump-single-json", "--playlist-end", str(limit), "--no-warnings", url
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        if res.returncode != 0:
+            raise RuntimeError(res.stderr.strip())
+        
+        data = json.loads(res.stdout.strip())
+        entries = data.get("entries", [])
+        tracks = []
+        for i, e in enumerate(entries):
+            track_id = e.get("id") or e.get("url", "").split("v=")[-1]
+            tracks.append({
+                "index": i,
+                "id": track_id,
+                "title": e.get("title") or f"Track {i+1}",
+                "thumbnail": e.get("thumbnail") or (f"https://i.ytimg.com/vi/{track_id}/mqdefault.jpg" if track_id else None),
+                "duration_str": seconds_to_ts(e.get("duration") or 0),
+                "url": e.get("url") or e.get("webpage_url") or f"https://www.youtube.com/watch?v={track_id}",
+            })
+        return {
+            "artist_name": data.get("title") or "Artist Page",
+            "count": len(tracks),
+            "tracks": tracks
+        }
+    except Exception as e:
+        raise HTTPException(400, str(e))
 
 
 HTML = r"""<!DOCTYPE html>
@@ -368,6 +433,40 @@ header {
   border: 1px solid var(--border);
   border-radius: var(--r);
   overflow: hidden;
+}
+
+/* Tab Header Navigation Styles */
+.tabs {
+  display: flex;
+  border-bottom: 1px solid var(--border);
+  background: rgba(255,255,255,0.01);
+}
+
+.tab-btn {
+  flex: 1;
+  background: transparent;
+  border: none;
+  color: var(--muted);
+  font-family: 'Syne', sans-serif;
+  font-weight: 700;
+  font-size: 0.72rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  padding: 16px;
+  cursor: pointer;
+  transition: color 0.15s, background 0.15s, border-color 0.15s;
+  border-bottom: 2px solid transparent;
+}
+
+.tab-btn:hover {
+  color: var(--text);
+  background: rgba(255,255,255,0.02);
+}
+
+.tab-btn.active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+  background: rgba(200,255,87,0.02);
 }
 
 .input-row { display: flex; align-items: center; }
@@ -736,6 +835,219 @@ header {
   transition: opacity 0.3s;
   letter-spacing: 0.06em;
 }
+
+/* ==========================================
+   NEW MUSIC ENGINE UI STYLE TOKENS
+   ========================================== */
+
+.music-filters {
+  display: flex;
+  gap: 8px;
+  padding: 12px 20px;
+  border-bottom: 1px solid var(--border);
+  background: rgba(0, 0, 0, 0.15);
+}
+
+.filter-pill {
+  background: transparent;
+  border: 1px solid var(--border2);
+  color: var(--muted);
+  font-family: 'DM Mono', monospace;
+  font-size: 0.65rem;
+  padding: 4px 12px;
+  border-radius: 20px;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.filter-pill:hover {
+  color: var(--text);
+  border-color: var(--muted);
+}
+
+.filter-pill.active {
+  color: #080809;
+  background: var(--accent);
+  border-color: var(--accent);
+  font-weight: 500;
+}
+
+/* Track list item */
+.song-item, .artist-item {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 14px 20px;
+  border-bottom: 1px solid var(--border);
+  transition: background 0.1s;
+}
+
+.song-item:last-child, .artist-item:last-child {
+  border-bottom: none;
+}
+
+.song-item:hover, .artist-item:hover {
+  background: var(--surface2);
+}
+
+.song-thumb {
+  width: 54px;
+  aspect-ratio: 16/9;
+  object-fit: cover;
+  border-radius: 4px;
+  background: var(--surface3);
+  flex-shrink: 0;
+}
+
+.artist-avatar {
+  width: 44px;
+  height: 44px;
+  object-fit: cover;
+  border-radius: 50%;
+  background: var(--surface3);
+  border: 1px solid var(--border2);
+  flex-shrink: 0;
+}
+
+.song-info, .artist-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.song-title, .artist-name {
+  font-family: 'Syne', sans-serif;
+  font-weight: 600;
+  font-size: 0.78rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  margin-bottom: 2px;
+}
+
+.song-uploader {
+  font-size: 0.65rem;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.song-dur {
+  font-size: 0.65rem;
+  color: var(--muted);
+  margin-right: 6px;
+  flex-shrink: 0;
+}
+
+.song-actions, .artist-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.preview-btn {
+  background: transparent;
+  border: 1px solid var(--border2);
+  color: var(--text);
+  font-family: 'DM Mono', monospace;
+  font-size: 0.6rem;
+  letter-spacing: 0.05em;
+  padding: 5px 10px;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: all 0.12s;
+}
+
+.preview-btn:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--accent-dim);
+}
+
+.preview-btn.playing {
+  border-color: var(--accent);
+  color: #080809;
+  background: var(--accent);
+  font-weight: bold;
+}
+
+.music-dl-group {
+  display: flex;
+  border: 1px solid var(--border2);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.music-dl-btn {
+  background: transparent;
+  border: none;
+  color: var(--muted);
+  font-family: 'DM Mono', monospace;
+  font-size: 0.58rem;
+  padding: 5px 8px;
+  cursor: pointer;
+  transition: all 0.12s;
+}
+
+.music-dl-btn:first-child {
+  border-right: 1px solid var(--border2);
+}
+
+.music-dl-btn:hover {
+  color: var(--accent);
+  background: var(--accent-dim);
+}
+
+.artist-view-btn {
+  background: transparent;
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  font-family: 'Syne', sans-serif;
+  font-weight: 700;
+  font-size: 0.62rem;
+  letter-spacing: 0.05em;
+  padding: 6px 12px;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.artist-view-btn:hover {
+  background: var(--accent);
+  color: #080809;
+}
+
+.artist-header-info {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 20px;
+  background: var(--surface2);
+  border-bottom: 1px solid var(--border);
+}
+
+.back-btn {
+  background: transparent;
+  border: 1px solid var(--border2);
+  color: var(--muted);
+  font-family: 'DM Mono', monospace;
+  font-size: 0.65rem;
+  padding: 6px 12px;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: all 0.15s;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin: 14px 20px;
+}
+
+.back-btn:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--accent-dim);
+}
 </style>
 </head>
 <body>
@@ -746,9 +1058,37 @@ header {
   </header>
 
   <div class="panel">
-    <div class="input-row">
-      <input class="url-input" id="url" type="text" placeholder="paste youtube url or playlist" autocomplete="off" spellcheck="false" />
-      <button class="run-btn" id="runBtn" onclick="run()">Run</button>
+    <!-- Active Switching Tabs -->
+    <div class="tabs">
+      <button class="tab-btn active" id="tabExtractor" onclick="switchTab('extractor')">URL Extractor</button>
+      <button class="tab-btn" id="tabMusic" onclick="switchTab('music')">Music Engine</button>
+    </div>
+
+    <!-- Mode 1: URL Extractor Section -->
+    <div id="extractorView">
+      <div class="input-row">
+        <input class="url-input" id="url" type="text" placeholder="paste youtube url or playlist" autocomplete="off" spellcheck="false" />
+        <button class="run-btn" id="runBtn" onclick="run()">Run</button>
+      </div>
+    </div>
+
+    <!-- Mode 2: Keyword Music Engine Section -->
+    <div id="musicView" style="display: none;">
+      <div class="input-row">
+        <input class="url-input" id="musicQuery" type="text" placeholder="search songs, artists, or albums" autocomplete="off" spellcheck="false" />
+        <button class="run-btn" id="musicSearchBtn" onclick="searchMusic()">Search</button>
+      </div>
+      <div class="music-filters">
+        <button class="filter-pill active" id="filterTracks" onclick="setMusicFilter('tracks')">Tracks</button>
+        <button class="filter-pill" id="filterArtists" onclick="setMusicFilter('artists')">Artists</button>
+      </div>
+      
+      <!-- List outputs -->
+      <div id="musicResults"></div>
+      <div id="artistResults"></div>
+      
+      <!-- Navigable Artist Release View -->
+      <div id="artistPageContainer" style="display: none;"></div>
     </div>
 
     <div class="progress-track" id="track">
@@ -790,6 +1130,12 @@ header {
 let _currentUrl = "";
 let _subtitlePollTimer = null;
 let _subtitleText = "";
+let _activeTab = "extractor";
+let _musicFilter = "tracks";
+
+// Live Preview audio control context
+let _previewAudio = new Audio();
+let _currentPreviewBtn = null;
 
 const formatCache = {};
 
@@ -801,7 +1147,11 @@ function setStatus(type, msg) {
 
 function setLoading(on) {
   document.getElementById('track').classList.toggle('active', on);
-  document.getElementById('runBtn').disabled = on;
+  if (_activeTab === 'extractor') {
+    document.getElementById('runBtn').disabled = on;
+  } else {
+    document.getElementById('musicSearchBtn').disabled = on;
+  }
 }
 
 function resetAll() {
@@ -815,6 +1165,233 @@ function resetAll() {
   document.getElementById('plHeader').className = 'playlist-header';
   document.getElementById('plList').className = 'playlist-list';
   document.getElementById('plList').innerHTML = '';
+  
+  // Cleanly clear and halt any running preview cut
+  _previewAudio.pause();
+  _previewAudio.src = "";
+  resetPreviewButtons();
+}
+
+function resetMusicView() {
+  document.getElementById('musicResults').innerHTML = '';
+  document.getElementById('artistResults').innerHTML = '';
+  document.getElementById('artistPageContainer').innerHTML = '';
+  document.getElementById('artistPageContainer').style.display = 'none';
+}
+
+function switchTab(tab) {
+  _activeTab = tab;
+  resetAll();
+  resetMusicView();
+  setStatus('', '');
+  
+  document.getElementById('tabExtractor').classList.toggle('active', tab === 'extractor');
+  document.getElementById('tabMusic').classList.toggle('active', tab === 'music');
+  
+  document.getElementById('extractorView').style.display = tab === 'extractor' ? '' : 'none';
+  document.getElementById('musicView').style.display = tab === 'music' ? '' : 'none';
+}
+
+function setMusicFilter(filter) {
+  _musicFilter = filter;
+  document.getElementById('filterTracks').classList.toggle('active', filter === 'tracks');
+  document.getElementById('filterArtists').classList.toggle('active', filter === 'artists');
+  
+  document.getElementById('musicResults').style.display = filter === 'tracks' ? '' : 'none';
+  document.getElementById('artistResults').style.display = filter === 'artists' ? '' : 'none';
+  document.getElementById('artistPageContainer').style.display = 'none';
+}
+
+// Global preview triggers
+function togglePreview(btn, url) {
+  if (_previewAudio.src === url || _previewAudio.src === window.location.origin + url) {
+    if (!_previewAudio.paused) {
+      _previewAudio.pause();
+      btn.textContent = 'Preview';
+      btn.classList.remove('playing');
+    } else {
+      _previewAudio.play();
+      btn.textContent = 'Pause';
+      btn.classList.add('playing');
+    }
+  } else {
+    resetPreviewButtons();
+    _previewAudio.src = url;
+    _currentPreviewBtn = btn;
+    btn.textContent = 'Loading...';
+    _previewAudio.play()
+      .then(() => {
+        btn.textContent = 'Pause';
+        btn.classList.add('playing');
+      })
+      .catch(() => {
+        setStatus('err', 'Could not stream preview track');
+        btn.textContent = 'Preview';
+        btn.classList.remove('playing');
+      });
+  }
+}
+
+function resetPreviewButtons() {
+  if (_currentPreviewBtn) {
+    _currentPreviewBtn.textContent = 'Preview';
+    _currentPreviewBtn.classList.remove('playing');
+    _currentPreviewBtn = null;
+  }
+}
+
+// Standard audio events
+_previewAudio.onended = () => {
+  resetPreviewButtons();
+};
+
+async function searchMusic() {
+  const query = document.getElementById('musicQuery').value.trim();
+  if (!query) return;
+  
+  resetAll();
+  resetMusicView();
+  setLoading(true);
+  setStatus('', `searching for ${query}...`);
+  
+  try {
+    if (_musicFilter === 'tracks') {
+      const res = await fetch(`/api/music/search?q=${encodeURIComponent(query)}`);
+      if (!res.ok) throw new Error(await res.text());
+      const data = await res.json();
+      
+      const container = document.getElementById('musicResults');
+      container.style.display = '';
+      if (data.results.length === 0) {
+        container.innerHTML = `<div class="status">No tracks found.</div>`;
+      } else {
+        let html = '';
+        data.results.forEach(t => {
+          html += `
+            <div class="song-item">
+              <img class="song-thumb" src="${t.thumbnail || ''}" alt="" />
+              <div class="song-info">
+                <div class="song-title">${escHtml(t.title)}</div>
+                <div class="song-uploader">${escHtml(t.uploader)}</div>
+              </div>
+              <div class="song-dur">${t.duration_str}</div>
+              <div class="song-actions">
+                <button class="preview-btn" onclick="togglePreview(this, '/api/music/preview?url=${encodeURIComponent(t.url)}')">Preview</button>
+                <div class="music-dl-group">
+                  <button class="music-dl-btn" onclick="dlMusic('${t.url}', 'mp3')">MP3</button>
+                  <button class="music-dl-btn" onclick="dlMusic('${t.url}', 'm4a')">M4A</button>
+                </div>
+              </div>
+            </div>`;
+        });
+        container.innerHTML = html;
+        setStatus('ok', `loaded ${data.results.length} tracks`);
+      }
+    } else {
+      const res = await fetch(`/api/music/artist/search?q=${encodeURIComponent(query)}`);
+      if (!res.ok) throw new Error(await res.text());
+      const data = await res.json();
+      
+      const container = document.getElementById('artistResults');
+      container.style.display = '';
+      if (data.artists.length === 0) {
+        container.innerHTML = `<div class="status">No artists found.</div>`;
+      } else {
+        let html = '';
+        data.artists.forEach(art => {
+          html += `
+            <div class="artist-item">
+              <img class="artist-avatar" src="${art.thumbnail || ''}" alt="" />
+              <div class="artist-info">
+                <div class="artist-name">${escHtml(art.name)}</div>
+              </div>
+              <button class="artist-view-btn" onclick="openArtistPage('${art.channel_url}')">View Artist</button>
+            </div>`;
+        });
+        container.innerHTML = html;
+        setStatus('ok', `loaded ${data.artists.length} artists`);
+      }
+    }
+  } catch (err) {
+    setStatus('err', err.message);
+  } finally {
+    setLoading(false);
+  }
+}
+
+async function openArtistPage(url) {
+  resetAll();
+  setLoading(true);
+  setStatus('', 'retrieving artist releases...');
+  
+  // Hide current search outputs to prioritize artist portfolio view
+  document.getElementById('musicResults').style.display = 'none';
+  document.getElementById('artistResults').style.display = 'none';
+  
+  const container = document.getElementById('artistPageContainer');
+  container.innerHTML = '';
+  container.style.display = '';
+  
+  try {
+    const res = await fetch(`/api/music/artist/page?url=${encodeURIComponent(url)}`);
+    if (!res.ok) throw new Error(await res.text());
+    const data = await res.json();
+    
+    let html = `
+      <button class="back-btn" onclick="exitArtistPage()">
+        <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M10 14L4 8l6-6"/>
+        </svg>
+        Back to Search
+      </button>
+      <div class="artist-header-info">
+        <div class="artist-info">
+          <div class="meta-title" style="font-size: 1.1rem; line-height: 1;">${escHtml(data.artist_name)}</div>
+          <div class="meta-duration" style="margin-top: 4px;">Latest ${data.count} Studio Releases</div>
+        </div>
+      </div>
+    `;
+    
+    data.tracks.forEach(t => {
+      html += `
+        <div class="song-item">
+          <img class="song-thumb" src="${t.thumbnail || ''}" alt="" />
+          <div class="song-info">
+            <div class="song-title">${escHtml(t.title)}</div>
+          </div>
+          <div class="song-dur">${t.duration_str}</div>
+          <div class="song-actions">
+            <button class="preview-btn" onclick="togglePreview(this, '/api/music/preview?url=${encodeURIComponent(t.url)}')">Preview</button>
+            <div class="music-dl-group">
+              <button class="music-dl-btn" onclick="dlMusic('${t.url}', 'mp3')">MP3</button>
+              <button class="music-dl-btn" onclick="dlMusic('${t.url}', 'm4a')">M4A</button>
+            </div>
+          </div>
+        </div>`;
+    });
+    
+    container.innerHTML = html;
+    setStatus('ok', `portfolio loaded`);
+  } catch (err) {
+    setStatus('err', err.message);
+  } finally {
+    setLoading(false);
+  }
+}
+
+function exitArtistPage() {
+  resetAll();
+  document.getElementById('artistPageContainer').style.display = 'none';
+  document.getElementById('artistPageContainer').innerHTML = '';
+  
+  // Re-establish filter outputs
+  document.getElementById('musicResults').style.display = _musicFilter === 'tracks' ? '' : 'none';
+  document.getElementById('artistResults').style.display = _musicFilter === 'artists' ? '' : 'none';
+  setStatus('ok', 'restored search view');
+}
+
+function dlMusic(url, format) {
+  window.location.href = `/api/music/download?url=${encodeURIComponent(url)}&format=${encodeURIComponent(format)}`;
 }
 
 async function run() {
@@ -1057,6 +1634,11 @@ function escHtml(str) {
 
 document.getElementById('url').addEventListener('keydown', e => {
   if (e.key === 'Enter') run();
+});
+
+// Input Row triggers for keyword search
+document.getElementById('musicQuery').addEventListener('keydown', e => {
+  if (e.key === 'Enter') searchMusic();
 });
 </script>
 </body>
