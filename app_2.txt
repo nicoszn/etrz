@@ -1,3 +1,4 @@
+```python
 import re
 import json
 import uuid
@@ -300,7 +301,7 @@ async def api_music_download(url: str, format: str = "mp3"):
 
 
 # ==========================================
-# ARTIST SEARCH & NAVIGATIONAL PAGE APIS
+# ARTIST SEARCH, PORTFOLIO & DIRECT MUSIC LINK APIS
 # ==========================================
 
 @app.get("/api/music/artist/search")
@@ -340,8 +341,17 @@ async def api_music_artist_page(url: str, limit: int = 30):
     if not url.startswith(("http://", "https://")):
         raise HTTPException(400, "Invalid artist URL")
     try:
+        target_url = url
+        # Point channel-specific URLs directly to the videos tab to prevent flat-playlist errors
+        if any(x in url for x in ["/channel/", "/user/", "/c/", "@"]):
+            parts = list(urllib.parse.urlparse(url))
+            path = parts[2].rstrip("/")
+            if not any(path.endswith(suffix) for suffix in ["/videos", "/releases", "/shorts", "/playlists", "/featured"]):
+                parts[2] = path + "/videos"
+                target_url = urllib.parse.urlunparse(parts)
+
         cmd = ytdlp_base() + [
-            "--flat-playlist", "--dump-single-json", "--playlist-end", str(limit), "--no-warnings", url
+            "--flat-playlist", "--dump-single-json", "--playlist-end", str(limit), "--no-warnings", target_url
         ]
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
         if res.returncode != 0:
@@ -351,6 +361,8 @@ async def api_music_artist_page(url: str, limit: int = 30):
         entries = data.get("entries", [])
         tracks = []
         for i, e in enumerate(entries):
+            if not e:
+                continue
             track_id = e.get("id") or e.get("url", "").split("v=")[-1]
             tracks.append({
                 "index": i,
@@ -365,6 +377,53 @@ async def api_music_artist_page(url: str, limit: int = 30):
             "count": len(tracks),
             "tracks": tracks
         }
+    except Exception as e:
+        raise HTTPException(400, str(e))
+
+@app.get("/api/music/link")
+async def api_music_link(url: str):
+    if not url.startswith(("http://", "https://")):
+        raise HTTPException(400, "Invalid URL")
+    try:
+        is_playlist = "list=" in url and "watch?v=" not in url
+        
+        if is_playlist:
+            cmd = ytdlp_base() + [
+                "--flat-playlist", "--dump-single-json", "--no-warnings", url
+            ]
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            if res.returncode != 0:
+                raise RuntimeError(res.stderr.strip())
+            data = json.loads(res.stdout.strip())
+            entries = data.get("entries", [])
+            results = []
+            for i, e in enumerate(entries):
+                if not e:
+                    continue
+                vid_id = e.get("id") or e.get("url", "").split("v=")[-1]
+                results.append({
+                    "id": vid_id,
+                    "title": e.get("title") or f"Track {i+1}",
+                    "uploader": e.get("uploader") or e.get("channel") or data.get("title") or "Unknown Artist",
+                    "thumbnail": e.get("thumbnail") or (f"https://i.ytimg.com/vi/{vid_id}/mqdefault.jpg" if vid_id else None),
+                    "duration": e.get("duration") or 0,
+                    "duration_str": seconds_to_ts(e.get("duration") or 0),
+                    "url": f"https://www.youtube.com/watch?v={vid_id}" if vid_id else (e.get("url") or e.get("webpage_url")),
+                })
+            return {"results": results, "title": data.get("title", "Album")}
+        else:
+            meta = get_video_metadata(url)
+            vid_id = meta.get("id")
+            track = {
+                "id": vid_id,
+                "title": meta.get("title") or "Unknown Track",
+                "uploader": meta.get("uploader") or meta.get("channel") or "Unknown Artist",
+                "thumbnail": meta.get("thumbnail") or (f"https://i.ytimg.com/vi/{vid_id}/mqdefault.jpg" if vid_id else None),
+                "duration": meta.get("duration") or 0,
+                "duration_str": seconds_to_ts(meta.get("duration") or 0),
+                "url": url,
+            }
+            return {"results": [track], "title": meta.get("title", "Track")}
     except Exception as e:
         raise HTTPException(400, str(e))
 
@@ -1080,6 +1139,7 @@ header {
       <div class="music-filters">
         <button class="filter-pill active" id="filterTracks" onclick="setMusicFilter('tracks')">Tracks</button>
         <button class="filter-pill" id="filterArtists" onclick="setMusicFilter('artists')">Artists</button>
+        <button class="filter-pill" id="filterLinks" onclick="setMusicFilter('links')">Links</button>
       </div>
 
       <!-- List outputs -->
@@ -1195,8 +1255,18 @@ function setMusicFilter(filter) {
   _musicFilter = filter;
   document.getElementById('filterTracks').classList.toggle('active', filter === 'tracks');
   document.getElementById('filterArtists').classList.toggle('active', filter === 'artists');
+  document.getElementById('filterLinks').classList.toggle('active', filter === 'links');
 
-  document.getElementById('musicResults').style.display = filter === 'tracks' ? '' : 'none';
+  const input = document.getElementById('musicQuery');
+  if (filter === 'links') {
+    input.placeholder = "paste youtube music single, album, or playlist link";
+  } else if (filter === 'artists') {
+    input.placeholder = "search for artists";
+  } else {
+    input.placeholder = "search songs, artists, or albums";
+  }
+
+  document.getElementById('musicResults').style.display = (filter === 'tracks' || filter === 'links') ? '' : 'none';
   document.getElementById('artistResults').style.display = filter === 'artists' ? '' : 'none';
   document.getElementById('artistPageContainer').style.display = 'none';
 }
@@ -1251,6 +1321,49 @@ async function searchMusic() {
   resetAll();
   resetMusicView();
   setLoading(true);
+
+  if (_musicFilter === 'links') {
+    setStatus('', 'retrieving content from link...');
+    try {
+      const res = await fetch(`/api/music/link?url=${encodeURIComponent(query)}`);
+      if (!res.ok) throw new Error(await res.text());
+      const data = await res.json();
+
+      const container = document.getElementById('musicResults');
+      container.style.display = '';
+      if (!data.results || data.results.length === 0) {
+        container.innerHTML = `<div class="status">No tracks found at this link.</div>`;
+      } else {
+        let html = '';
+        data.results.forEach(t => {
+          html += `
+            <div class="song-item">
+              <img class="song-thumb" src="${t.thumbnail || ''}" alt="" />
+              <div class="song-info">
+                <div class="song-title">${escHtml(t.title)}</div>
+                <div class="song-uploader">${escHtml(t.uploader)}</div>
+              </div>
+              <div class="song-dur">${t.duration_str}</div>
+              <div class="song-actions">
+                <button class="preview-btn" onclick="togglePreview(this, '/api/music/preview?url=${encodeURIComponent(t.url)}')">Preview</button>
+                <div class="music-dl-group">
+                  <button class="music-dl-btn" onclick="dlMusic('${t.url}', 'mp3')">MP3</button>
+                  <button class="music-dl-btn" onclick="dlMusic('${t.url}', 'm4a')">M4A</button>
+                </div>
+              </div>
+            </div>`;
+        });
+        container.innerHTML = html;
+        setStatus('ok', `loaded ${data.results.length} tracks from ${data.title}`);
+      }
+    } catch (err) {
+      setStatus('err', err.message);
+    } finally {
+      setLoading(false);
+    }
+    return;
+  }
+
   setStatus('', `searching for ${query}...`);
 
   try {
@@ -1384,7 +1497,7 @@ function exitArtistPage() {
   document.getElementById('artistPageContainer').innerHTML = '';
 
   // Re-establish filter outputs
-  document.getElementById('musicResults').style.display = _musicFilter === 'tracks' ? '' : 'none';
+  document.getElementById('musicResults').style.display = (_musicFilter === 'tracks' || _musicFilter === 'links') ? '' : 'none';
   document.getElementById('artistResults').style.display = _musicFilter === 'artists' ? '' : 'none';
   setStatus('ok', 'restored search view');
 }
@@ -1646,3 +1759,5 @@ document.getElementById('musicQuery').addEventListener('keydown', e => {
 @app.get("/", response_class=HTMLResponse)
 async def index():
     return HTMLResponse(content=HTML)
+
+```
