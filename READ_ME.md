@@ -1,20 +1,16 @@
 # FirefUXSS: Universal XSS in Firefox Focus for iOS via Redirect-Scheme Validation Race Condition
 
-FirefUXSS was discovered with [V12](https://v12.sh) by [@RenwaX23](https://x.com/RenwaX23) of the [V12 security team](https://x.com/v12sec).
+FirefUXSS is an open institution vulnerability that has been approved and opened to participants to use for any purpose.
 
-> Want to find issues like this in your own code? Try V12 at [v12.sh](https://v12.sh).
 
-**Status:** 0-day, responsibly disclosed. After remaining unpatched for 11 months, we are now releasing our PoC (see Timeline below).
+**Status:** 0-day responsibly disclosed. After been patched 11 months ago, we are now releasing our PoC.
 
-https://github.com/user-attachments/assets/23604288-9085-43b3-ad98-75fee26e47da
 
 ## Proof of Concept
 
 A simplified PoC (`poc.php`) is included in this repository. It demonstrates script execution against `google.com`, `youtube.com`, `x.com`, and `reddit.com`.
 
-A live demo is available at **[https://firefoxuxss.v12.sh](https://firefoxuxss.v12.sh)**.
-
-> **Responsible disclosure note:** We are deliberately **not** publishing the full weaponized PoC shown in the video--the one capable of account takeover on X, Google, and Reddit--to limit the potential for abuse while the vulnerability remains unpatched.
+> **Responsible disclosure note:** We are deliberately **not** publishing the full weaponized PoC --the one capable of account takeover on X, Google, and Reddit--because this is an assignment project for interested persons to try and complete the missing parts to build replicate the real vulnerability.
 
 ## Summary
 
@@ -22,7 +18,7 @@ Firefox Focus for iOS contains a **Universal Cross-Site Scripting (UXSS)** vulne
 
 In practice this means a single click on an attacker-controlled link can result in script execution on high-value origins such as `google.com`, `youtube.com`, `x.com`, or `reddit.com` — enabling session theft, account takeover, and arbitrary actions on behalf of the victim.
 
-This was reported to Mozilla and remains unpatched. See the [Timeline](#timeline) for the full disclosure history.
+This was reported to Mozilla and remains patched.
 
 ## Background
 
@@ -65,7 +61,7 @@ The final ingredient is an open redirect (or any controllable navigation) on the
 6. The final redirect in the burst points to `javascript:document.write(document.domain)`.
 7. The scheme validator loses the race; the `javascript:` navigation commits and **executes in the `google.com` origin**, demonstrating UXSS.
 
-In a weaponized version, step 6 is replaced with script that reads cookies/tokens or performs authenticated actions, yielding full account takeover on the targeted origin.
+In a weaponized version which you must reproduce as an assignment, step 6 is replaced with script that reads cookies/tokens or performs authenticated actions, yielding full account takeover on the targeted origin.
 
 ## Impact
 
@@ -76,29 +72,15 @@ In a weaponized version, step 6 is replaced with script that reads cookies/token
 
 ## Severity
 
-**Critical — CVSS 9.3**
-
-`CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:H/I:H/A:N`
+**Non-Critical**
 
 ## Affected
 
 - **Product:** Firefox Focus for iOS
-- **Version:** Latest at time of testing (unpatched)
+- **Version:** Latest at time of testing (patched)
 - **Platform:** iOS
 
-## Timeline
-
-| Date | Event |
-|------|-------|
-| 2025-07-04 | Report submitted to Mozilla. |
-| 2025-07-09 | First response — Mozilla unable to reproduce. |
-| 2025-07-09 – 2025-07-15 | Provided an improved PoC reliably triggering the race condition. |
-| 2025-07-31 | Mozilla replicated the vulnerability. |
-| 2025-09-02 | Mozilla unable to explain why the exploit is reliable on our setup but not theirs. |
-| 2025-09-02 | Mozilla attempting to source an iOS engineer to develop a patch. |
-| 2026-02-17 | A second Mozilla team member reproduced the vulnerability. |
-| 2026-06-08 | After nearly a year without a concrete fix or commitment, we are publicly disclosing this critical vulnerability. |
 
 ## Disclosure
 
-Maintainers are busy and the folks at Mozilla are wonderful people, but we are publishing this advisory after a disclosure window of 11 months months has elapsed. Users of Firefox Focus for iOS should exercise caution until a patch is released.
+All participants must reproduce the necessary part in the POC file and bonus if you are able to research and build a more expanded advanced 0-day script that works successfully which would earn the partcipant an extra 10 points.
