@@ -1059,3 +1059,7 @@ document.getElementById('musicInput').addEventListener('keydown', e => { if (e.k
 @app.get("/", response_class=HTMLResponse)
 async def index():
     return HTMLResponse(content=HTML)
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
