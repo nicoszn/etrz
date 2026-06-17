@@ -743,6 +743,7 @@ async def api_music_link(url: str):
     except Exception as e:
         logger.error(f"Unexpected error in music link: {url}", exc_info=True)
         raise HTTPException(400, "An unexpected backend error occurred.")
+
 # ────────────────────────────────────────────────────────────────────────────
 # STATIC HTML UI (unchanged)
 # ────────────────────────────────────────────────────────────────────────────
