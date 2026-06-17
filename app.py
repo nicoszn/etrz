@@ -1,87 +1,115 @@
-import re
+import asyncio
 import json
-import uuid
-import time
-import subprocess
-import threading
-import urllib.parse
 import logging
-from pathlib import Path
+import re
+import threading
+import time
+import urllib.parse
+import uuid
 from collections import defaultdict
-
+from pathlib import Path
+from typing import AsyncGenerator, Dict, Any, List
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 
-# Setup logging
+# ── LOGGING CONFIGURATION ──────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.ERROR,
     format="%(asctime)s [%(levelname)s] %(name)s - %(message)s"
 )
 logger = logging.getLogger("yte")
 
+# ── PATHS AND GLOBALS ──────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).parent
 COOKIES = BASE_DIR / "cookies.txt"
 TEMP = BASE_DIR / "temp"
 TEMP.mkdir(exist_ok=True)
 
 app = FastAPI(title="YTE")
-JOBS = {}
-JOBS_LOCK = threading.Lock()
-JOB_TTL = 1800
 
-def job_set(job_id, state, data=None, error=None):
-    with JOBS_LOCK:
-        JOBS[job_id] = {"state": state, "data": data or {}, "error": error, "ts": time.time()}
+# Thread-safe job cache for subtitle extraction
+JOB_CACHE: Dict[str, Dict[str, Any]] = {}
+CACHE_LOCK = threading.Lock()
+TTL_SECONDS = 1800
 
-def _prune_jobs():
+def update_job_state(job_id: str, state: str, data: dict = None, error: str = None) -> None:
+    with CACHE_LOCK:
+        JOB_CACHE[job_id] = {
+            "state": state,
+            "data": data or {},
+            "error": error,
+            "ts": time.time()
+        }
+
+def _cache_purger_worker() -> None:
     while True:
         time.sleep(300)
-        cutoff = time.time() - JOB_TTL
-        with JOBS_LOCK:
-            stale = [k for k, v in JOBS.items() if v.get("ts", 0) < cutoff]
-            for k in stale:
-                del JOBS[k]
+        expiry_threshold = time.time() - TTL_SECONDS
+        with CACHE_LOCK:
+            expired_keys = [k for k, v in JOB_CACHE.items() if v.get("ts", 0) < expiry_threshold]
+            for k in expired_keys:
+                del JOB_CACHE[k]
 
-threading.Thread(target=_prune_jobs, daemon=True).start()
+threading.Thread(target=_cache_purger_worker, daemon=True).start()
 
-def seconds_to_ts(s: float) -> str:
-    s = round(s, 3)
-    h, rem = divmod(s, 3600)
-    m, sec = divmod(rem, 60)
-    return f"{int(h):02d}:{int(m):02d}:{sec:06.3f}"
+# ── CORE UTILITIES ──────────────────────────────────────────────────────────
+def format_duration_string(seconds: float) -> str:
+    seconds = round(seconds, 3)
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{int(hours):02d}:{int(minutes):02d}:{secs:06.3f}"
 
-def ytdlp_base():
-    cmd = ["yt-dlp"]
+def get_ytdlp_base_arguments() -> List[str]:
+    args = ["yt-dlp"]
     if COOKIES.exists():
-        cmd += ["--cookies", str(COOKIES)]
-    return cmd
+        args += ["--cookies", str(COOKIES)]
+    args += ["--extractor-args", "youtube:client=web_music"]
+    return args
 
-def extract_plain_text_from_vtt(vtt_path: Path) -> str:
-    if not vtt_path.exists():
+def extract_clean_subtitle_text(subtitle_path: Path) -> str:
+    if not subtitle_path.exists():
         return ""
     lines = []
-    with open(vtt_path, 'r', encoding='utf-8') as f:
+    with open(subtitle_path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
-            if line and not ('-->' in line or line.startswith('WEBVTT') or line.isdigit()):
-                clean = re.sub(r'<[^>]+>', '', line)
-                if clean:
-                    lines.append(clean)
-    return ' '.join(lines)
+            if line and not ("-->" in line or line.startswith("WEBVTT") or line.isdigit()):
+                cleaned = re.sub(r"<[^>]+>", "", line)
+                if cleaned:
+                    lines.append(cleaned)
+    return " ".join(lines)
 
-def get_video_metadata(url: str) -> dict:
-    cmd = ytdlp_base() + ["--dump-json", "--no-playlist", url]
-    res = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-    if res.returncode != 0:
-        raise RuntimeError(res.stderr.strip())
-    return json.loads(res.stdout.strip())
+async def fetch_video_metadata(url: str) -> dict:
+    if "youtube.com/watch" in url and "music.youtube.com" not in url:
+        url = url.replace("youtube.com/watch", "music.youtube.com/watch")
 
-def normalize_formats(metadata: dict) -> list:
+    args = get_ytdlp_base_arguments() + ["--dump-json", "--no-playlist", url]
+    process = await asyncio.create_subprocess_exec(
+        *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=60)
+    except asyncio.TimeoutError:
+        if process.returncode is None:
+            process.kill()
+            await process.wait()
+        raise RuntimeError("Metadata fetch timed out")
+
+    if process.returncode != 0:
+        err = stderr.decode(errors="ignore").strip()
+        logger.error(f"yt-dlp metadata error: {err}")
+        raise RuntimeError(f"yt-dlp failed: {err}")
+    return json.loads(stdout.decode(errors="ignore").strip())
+
+def parse_and_rank_formats(metadata: dict) -> List[dict]:
     formats = metadata.get("formats", [])
-    res_map = defaultdict(list)
-    container_priority = {"mp4": 1, "m4a": 2, "webm": 3, "mkv": 4, "avi": 5, "mov": 6}
+    format_map = defaultdict(list)
+
+    ext_priority = {"mp4": 1, "m4a": 2, "webm": 3, "mkv": 4, "avi": 5, "mov": 6}
     codec_priority = {"hevc": 1, "h265": 1, "avc1": 2, "h264": 2, "vp9": 3, "av01": 4, "vp8": 5}
 
     for f in formats:
@@ -89,83 +117,128 @@ def normalize_formats(metadata: dict) -> list:
         if not height and "p" in f.get("format_note", ""):
             try:
                 height = int(f.get("format_note", "").replace("p", ""))
-            except:
+            except ValueError:
                 height = None
+
         if height is None or height < 360:
-            continue
+            if f.get("vcodec") == "none" and f.get("acodec") != "none":
+                height = 360
+            else:
+                continue
+
         size_mb = None
         if f.get("filesize"):
             size_mb = round(f["filesize"] / (1024 * 1024), 1)
         elif f.get("filesize_approx"):
             size_mb = round(f["filesize_approx"] / (1024 * 1024), 1)
+
         ext = f.get("ext", "").lower()
         vcodec = f.get("vcodec", "").lower()
-        codec = vcodec.split('.')[0] if vcodec else "unknown"
-        container_score = container_priority.get(ext, 99)
-        codec_score = codec_priority.get(codec, 99)
-        has_both = (f.get("vcodec") != "none" and f.get("acodec") != "none")
-        rank = (container_score, codec_score, size_mb if size_mb is not None else 1e9, -10 if has_both else 0)
-        res_map[height].append({"format_id": f["format_id"], "resolution": f"{height}p", "ext": ext, "size_mb": size_mb, "rank": rank})
+        codec_base = vcodec.split(".")[0] if vcodec else "unknown"
 
-    unique = []
-    for height, entries in res_map.items():
-        entries.sort(key=lambda x: x["rank"])
-        best = entries[0]
-        unique.append({"format_id": best["format_id"], "resolution": best["resolution"], "ext": best["ext"], "size_mb": best["size_mb"]})
-    unique.sort(key=lambda x: int(x["resolution"].rstrip("p")), reverse=True)
-    return unique
+        ext_score = ext_priority.get(ext, 99)
+        codec_score = codec_priority.get(codec_base, 99)
+        has_both_tracks = (f.get("vcodec") != "none" and f.get("acodec") != "none")
 
-def subtitle_worker(job_id, url):
+        rank_tuple = (ext_score, codec_score, size_mb if size_mb is not None else 1e9, -10 if has_both_tracks else 0)
+
+        format_map[height].append({
+            "format_id": f["format_id"],
+            "resolution": f"{height}p" if f.get("vcodec") != "none" else "Audio-Only",
+            "ext": ext,
+            "size_mb": size_mb,
+            "rank": rank_tuple
+        })
+
+    optimized_list = []
+    for height, entries in format_map.items():
+        entries.sort(key=lambda item: item["rank"])
+        best_entry = entries[0]
+        optimized_list.append({
+            "format_id": best_entry["format_id"],
+            "resolution": best_entry["resolution"],
+            "ext": best_entry["ext"],
+            "size_mb": best_entry["size_mb"]
+        })
+
+    optimized_list.sort(key=lambda x: int(x["resolution"].rstrip("p")) if x["resolution"] != "Audio-Only" else 0, reverse=True)
+    return optimized_list
+
+def _subtitle_extraction_sync_worker(job_id: str, url: str) -> None:
+    import subprocess
     try:
-        tmp_base = TEMP / f"sub_{job_id}"
-        sub_cmd = ytdlp_base() + ["--skip-download", "--write-auto-subs", "--write-subs",
-                                  "--sub-langs", "en", "--sub-format", "vtt", "-o", str(tmp_base), url]
-        subprocess.run(sub_cmd, capture_output=True, timeout=60)
-        vtt_path = Path(str(tmp_base) + ".en.vtt")
-        sub_text = extract_plain_text_from_vtt(vtt_path)
-        vtt_path.unlink(missing_ok=True)
-        job_set(job_id, "done", {"subtitle_text": sub_text})
-    except Exception as ex:
-        logger.error(f"Subtitle worker failed for {url}", exc_info=True)
-        job_set(job_id, "error", error="Subtitle extraction failed, please try again.")
+        if "youtube.com/watch" in url and "music.youtube.com" not in url:
+            url = url.replace("youtube.com/watch", "music.youtube.com/watch")
+
+        temp_output_path = TEMP / f"sub_{job_id}"
+        args = get_ytdlp_base_arguments() + [
+            "--skip-download", "--write-auto-subs", "--write-subs",
+            "--sub-langs", "en", "--sub-format", "vtt", "-o", str(temp_output_path), url
+        ]
+        subprocess.run(args, capture_output=True, timeout=60)
+        vtt_file = Path(str(temp_output_path) + ".en.vtt")
+        text = extract_clean_subtitle_text(vtt_file)
+        vtt_file.unlink(missing_ok=True)
+        update_job_state(job_id, "done", {"subtitle_text": text})
+    except Exception:
+        logger.error(f"Subtitle worker exception for {url}", exc_info=True)
+        update_job_state(job_id, "error", error="Subtitle extraction failed")
 
 class UrlRequest(BaseModel):
     url: str
 
+# ── URL DETECTION HELPERS ──────────────────────────────────────────────────
 def is_playlist_url(url: str) -> bool:
     return "list=" in url and "watch?v=" not in url
 
 def is_channel_url(url: str) -> bool:
     return any(x in url for x in ["/channel/", "/user/", "/c/", "/@"]) and "watch?v=" not in url
 
+# ── CORE VIDEO ENDPOINTS ───────────────────────────────────────────────────
 @app.post("/api/detect")
 async def api_detect(req: UrlRequest):
     url = req.url.strip()
-    return {
-        "is_playlist": is_playlist_url(url),
-        "is_channel": is_channel_url(url)
-    }
+    return {"is_playlist": is_playlist_url(url), "is_channel": is_channel_url(url)}
 
 @app.post("/api/playlist")
 async def api_playlist(req: UrlRequest):
     try:
-        cmd = ytdlp_base() + [
-            "--flat-playlist", "--dump-single-json", "--no-warnings", req.url
-        ]
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        if res.returncode != 0:
-            raise RuntimeError(res.stderr.strip())
-        data = json.loads(res.stdout.strip())
+        args = get_ytdlp_base_arguments() + ["--flat-playlist", "--dump-single-json", "--no-warnings", req.url]
+        process = await asyncio.create_subprocess_exec(
+            *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=120)
+        except asyncio.TimeoutError:
+            if process.returncode is None:
+                process.kill()
+                await process.wait()
+            logger.error(f"Playlist extraction timed out: {req.url}")
+            raise HTTPException(status_code=408, detail="Operation timed out")
+
+        if process.returncode != 0:
+            err = stderr.decode(errors="ignore").strip()
+            logger.error(f"yt-dlp playlist error: {err}")
+            raise HTTPException(status_code=400, detail="yt-dlp failed to fetch playlist.")
+
+        try:
+            data = json.loads(stdout.decode(errors="ignore").strip())
+        except json.JSONDecodeError as e:
+            logger.error(f"Invalid JSON from playlist: {e}")
+            raise HTTPException(status_code=400, detail="Malformed payload from video provider.")
+
         entries = data.get("entries", [])
         videos = []
         for i, e in enumerate(entries):
+            if not e:
+                continue
             vid_id = e.get("id") or e.get("url", "").split("v=")[-1]
             videos.append({
                 "index": i,
                 "id": vid_id,
                 "title": e.get("title") or e.get("webpage_url_basename") or f"Video {i+1}",
                 "thumbnail": e.get("thumbnail") or (f"https://i.ytimg.com/vi/{vid_id}/mqdefault.jpg" if vid_id else None),
-                "duration_str": seconds_to_ts(e.get("duration") or 0),
+                "duration_str": format_duration_string(e.get("duration") or 0),
                 "url": e.get("url") or e.get("webpage_url") or f"https://www.youtube.com/watch?v={vid_id}",
             })
         return {
@@ -173,40 +246,46 @@ async def api_playlist(req: UrlRequest):
             "count": len(videos),
             "videos": videos
         }
+
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Playlist extraction failed: {req.url}", exc_info=True)
-        raise HTTPException(400, "Unable to fetch playlist, please try again later.")
+        logger.error(f"Unexpected error in playlist extraction: {req.url}", exc_info=True)
+        raise HTTPException(status_code=400, detail="An unexpected backend error occurred.")
 
 @app.post("/api/channel")
 async def api_channel(req: UrlRequest, tab: str = "videos"):
     try:
         url = req.url.strip()
-        # Clean any appended tabs to prevent double-concatenation
         for suffix in ["/videos", "/shorts", "/live", "/playlists", "/releases", "/featured"]:
             if url.endswith(suffix):
                 url = url[:-len(suffix)]
         url = url.rstrip("/")
-        
-        target_url = url
-        if tab != "featured":
-            target_url = f"{url}/{tab}"
-            
-        cmd = ytdlp_base() + [
-            "--flat-playlist", "--dump-single-json", "--playlist-end", "50", "--no-warnings", target_url
-        ]
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        
-        # Fallback to the channel base URL if the requested tab doesn't exist
-        if res.returncode != 0 and tab != "featured":
-            cmd = ytdlp_base() + [
-                "--flat-playlist", "--dump-single-json", "--playlist-end", "50", "--no-warnings", url
-            ]
-            res = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-            
-        if res.returncode != 0:
-            raise RuntimeError(res.stderr.strip())
-            
-        data = json.loads(res.stdout.strip())
+        target_url = url if tab == "featured" else f"{url}/{tab}"
+
+        async def run_ytdlp(target):
+            args = get_ytdlp_base_arguments() + ["--flat-playlist", "--dump-single-json", "--playlist-end", "50", "--no-warnings", target]
+            proc = await asyncio.create_subprocess_exec(*args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            out, err = await asyncio.wait_for(proc.communicate(), timeout=120)
+            return proc, out, err
+
+        process, stdout, stderr = await run_ytdlp(target_url)
+
+        if process.returncode != 0 and tab != "featured":
+            fallback_url = url
+            process, stdout, stderr = await run_ytdlp(fallback_url)
+
+        if process.returncode != 0:
+            err = stderr.decode(errors="ignore").strip()
+            logger.error(f"yt-dlp channel error: {err}")
+            raise HTTPException(status_code=400, detail="Failed to fetch channel content.")
+
+        try:
+            data = json.loads(stdout.decode(errors="ignore").strip())
+        except json.JSONDecodeError as e:
+            logger.error(f"Invalid JSON from channel: {e}")
+            raise HTTPException(status_code=400, detail="Malformed payload from video provider.")
+
         entries = data.get("entries", [])
         items = []
         for i, e in enumerate(entries):
@@ -219,93 +298,137 @@ async def api_channel(req: UrlRequest, tab: str = "videos"):
                 "id": vid_id,
                 "title": e.get("title") or f"Item {i+1}",
                 "thumbnail": e.get("thumbnail") or (f"https://i.ytimg.com/vi/{vid_id}/mqdefault.jpg" if vid_id else None),
-                "duration_str": seconds_to_ts(e.get("duration") or 0) if not is_pl else "Playlist",
+                "duration_str": format_duration_string(e.get("duration") or 0) if not is_pl else "Playlist",
                 "url": e.get("url") or e.get("webpage_url") or f"https://www.youtube.com/watch?v={vid_id}",
                 "is_playlist": is_pl
             })
-            
         return {
             "channel_title": data.get("title") or "Channel Feed",
-            "channel_url": url,
+            "channel_url": req.url.strip(),
             "tab": tab,
             "count": len(items),
             "items": items
         }
+
+    except HTTPException:
+        raise
+    except asyncio.TimeoutError:
+        logger.error(f"Channel fetch timed out: {req.url}")
+        raise HTTPException(status_code=408, detail="Operation timed out")
     except Exception as e:
-        logger.error(f"Channel extraction failed: {req.url} (tab={tab})", exc_info=True)
-        raise HTTPException(400, "Unable to fetch channel content, please try again later.")
+        logger.error(f"Unexpected error in channel fetch: {req.url}", exc_info=True)
+        raise HTTPException(status_code=400, detail="An unexpected backend error occurred.")
 
 @app.post("/api/formats")
 async def api_formats(req: UrlRequest):
     try:
-        meta = get_video_metadata(req.url)
-        formats = normalize_formats(meta)
+        metadata = await fetch_video_metadata(req.url)
+        ranked_formats = parse_and_rank_formats(metadata)
         job_id = str(uuid.uuid4())
-        job_set(job_id, "running")
-        threading.Thread(target=subtitle_worker, args=(job_id, req.url), daemon=True).start()
+        update_job_state(job_id, "running")
+        threading.Thread(target=_subtitle_extraction_sync_worker, args=(job_id, req.url), daemon=True).start()
         return {
-            "video_id": meta.get("id"),
-            "title": meta.get("title"),
-            "thumbnail": meta.get("thumbnail"),
-            "duration_str": seconds_to_ts(meta.get("duration", 0)),
-            "formats": formats,
+            "video_id": metadata.get("id"),
+            "title": metadata.get("title"),
+            "thumbnail": metadata.get("thumbnail"),
+            "duration_str": format_duration_string(metadata.get("duration", 0)),
+            "formats": ranked_formats,
             "subtitle_job_id": job_id
         }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Format extraction failed: {req.url}", exc_info=True)
-        raise HTTPException(400, "Unable to get video formats, please try again later.")
+        raise HTTPException(status_code=400, detail="Unable to get video formats, please try again later.")
 
 @app.get("/api/stream")
 async def stream_video(url: str, format_id: str):
     if not url.startswith(("http://", "https://")):
-        raise HTTPException(400, "Invalid URL")
-    if not re.match(r'^[\w\+]+$', format_id):
-        raise HTTPException(400, "Invalid format_id")
-    try:
-        cmd = ytdlp_base() + ["-f", format_id, "-o", "-", "--no-playlist", url]
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    except Exception as e:
-        logger.error(f"Stream process start failed: {url} / {format_id}", exc_info=True)
-        raise HTTPException(400, "Could not start stream, please try again later.")
+        raise HTTPException(status_code=400, detail="Invalid URL")
+    if not re.match(r'^[\w\+\-]+$', format_id):
+        raise HTTPException(status_code=400, detail="Invalid format_id")
 
-    def generate():
-        while True:
-            chunk = proc.stdout.read(8192)
-            if not chunk:
-                break
-            yield chunk
-    return StreamingResponse(generate(), media_type="video/mp4",
-                             headers={"Content-Disposition": f"attachment; filename=video_{format_id}.mp4"})
+    args = get_ytdlp_base_arguments() + ["-f", format_id, "-o", "-", "--no-playlist", url]
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+    except Exception as e:
+        logger.error(f"Stream process creation failed: {e}")
+        raise HTTPException(status_code=400, detail="Could not start stream, please try again later.")
+
+    async def stream_generator() -> AsyncGenerator[bytes, None]:
+        try:
+            while True:
+                chunk = await asyncio.wait_for(process.stdout.read(8192), timeout=30.0)
+                if not chunk:
+                    break
+                yield chunk
+        except asyncio.TimeoutError:
+            logger.error("Stream read timeout")
+            if process.returncode is None:
+                process.kill()
+                await process.wait()
+        finally:
+            if process.returncode is None:
+                try:
+                    process.kill()
+                    await process.wait()
+                except Exception:
+                    pass
+
+    return StreamingResponse(
+        stream_generator(),
+        media_type="video/mp4",
+        headers={"Content-Disposition": f"attachment; filename=video_{format_id}.mp4"}
+    )
 
 @app.get("/api/job/{job_id}")
 async def api_job(job_id: str):
-    with JOBS_LOCK:
-        return dict(JOBS.get(job_id, {"state": "not_found"}))
+    with CACHE_LOCK:
+        return dict(JOB_CACHE.get(job_id, {"state": "not_found"}))
 
-
-# ==========================================
-# REFINED YOUTUBE MUSIC SEARCH & STREAMING APIS
-# ==========================================
-
+# ── MUSIC ENDPOINTS ─────────────────────────────────────────────────────────
 @app.get("/api/music/search")
 async def api_music_search(q: str, limit: int = 10):
     if not q:
-        raise HTTPException(400, "Search query is required")
+        raise HTTPException(status_code=400, detail="Search query is required")
     try:
-        optimized_query = f"{q} official audio"
-        search_query = f"ytsearch{limit}:{optimized_query}"
-
-        cmd = ytdlp_base() + [
-            "--flat-playlist", "--dump-single-json", "--no-warnings", search_query
+        search_param = f"ytsearch{limit}:{q}"
+        args = get_ytdlp_base_arguments() + [
+            "--flat-playlist", "--dump-single-json", "--no-warnings",
+            "--default-search", "ytsearch", search_param
         ]
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        if res.returncode != 0:
-            raise RuntimeError(res.stderr.strip())
+        process = await asyncio.create_subprocess_exec(
+            *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=120)
+        except asyncio.TimeoutError:
+            if process.returncode is None:
+                process.kill()
+                await process.wait()
+            logger.error(f"Music search timed out for: {q}")
+            raise HTTPException(status_code=408, detail="Operation timed out")
 
-        data = json.loads(res.stdout.strip())
+        if process.returncode != 0:
+            err = stderr.decode(errors="ignore").strip()
+            logger.error(f"yt-dlp search error: {err}")
+            raise HTTPException(status_code=400, detail="yt-dlp search failed.")
+
+        try:
+            data = json.loads(stdout.decode(errors="ignore").strip())
+        except json.JSONDecodeError as e:
+            logger.error(f"Invalid JSON from search: {e}")
+            raise HTTPException(status_code=400, detail="Malformed response from video provider.")
+
         entries = data.get("entries", [])
         results = []
         for i, e in enumerate(entries):
+            if not e:
+                continue
             vid_id = e.get("id") or e.get("url", "").split("v=")[-1]
             results.append({
                 "id": vid_id,
@@ -313,108 +436,166 @@ async def api_music_search(q: str, limit: int = 10):
                 "uploader": e.get("uploader") or e.get("channel") or "Unknown Artist",
                 "thumbnail": e.get("thumbnail") or (f"https://i.ytimg.com/vi/{vid_id}/mqdefault.jpg" if vid_id else None),
                 "duration": e.get("duration") or 0,
-                "duration_str": seconds_to_ts(e.get("duration") or 0),
+                "duration_str": format_duration_string(e.get("duration") or 0),
                 "url": f"https://www.youtube.com/watch?v={vid_id}" if vid_id else (e.get("url") or e.get("webpage_url")),
             })
         return {"results": results}
+
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Music search failed: q={q}", exc_info=True)
-        raise HTTPException(400, "Music search failed, please try again later.")
+        logger.error(f"Unexpected error in music search: q={q}", exc_info=True)
+        raise HTTPException(status_code=400, detail="An unexpected backend error occurred.")
 
 @app.get("/api/music/preview")
 async def api_music_preview(url: str):
     if not url.startswith(("http://", "https://")):
-        raise HTTPException(400, "Invalid URL")
-    try:
-        cmd = ytdlp_base() + ["-f", "ba", "--download-sections", "*00:00-00:30", "-o", "-", "--no-playlist", url]
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    except Exception as e:
-        logger.error(f"Preview stream start failed: {url}", exc_info=True)
-        raise HTTPException(400, "Could not start preview, please try again later.")
+        raise HTTPException(status_code=400, detail="Invalid URL")
 
-    def generate():
+    if "youtube.com" in url and "music.youtube.com" not in url:
+        url = url.replace("youtube.com", "music.youtube.com")
+
+    args = get_ytdlp_base_arguments() + [
+        "-f", "ba",
+        "-x", "--audio-format", "mp3",
+        "--download-sections", "*00:00-00:30",
+        "-o", "-",
+        "--no-playlist",
+        url
+    ]
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+    except Exception as e:
+        logger.error(f"Preview process creation failed: {e}")
+        raise HTTPException(status_code=400, detail="Could not start preview, please try again later.")
+
+    async def preview_generator() -> AsyncGenerator[bytes, None]:
         try:
             while True:
-                chunk = proc.stdout.read(8192)
+                chunk = await asyncio.wait_for(process.stdout.read(8192), timeout=30.0)
                 if not chunk:
                     break
                 yield chunk
+        except asyncio.TimeoutError:
+            logger.error("Preview stream read timeout")
+            if process.returncode is None:
+                process.kill()
+                await process.wait()
         finally:
-            proc.terminate()
-            proc.wait()
+            if process.returncode is None:
+                try:
+                    process.kill()
+                    await process.wait()
+                except Exception:
+                    pass
 
-    return StreamingResponse(generate(), media_type="audio/mp4")
+    return StreamingResponse(preview_generator(), media_type="audio/mpeg")
 
 @app.get("/api/music/download")
 async def api_music_download(url: str, format: str = "mp3"):
     if not url.startswith(("http://", "https://")):
-        raise HTTPException(400, "Invalid URL")
+        raise HTTPException(status_code=400, detail="Invalid URL")
+
+    if "youtube.com" in url and "music.youtube.com" not in url:
+        url = url.replace("youtube.com", "music.youtube.com")
 
     try:
-        meta = get_video_metadata(url)
-        title = meta.get("title", "audio_track")
+        metadata = await fetch_video_metadata(url)
+        title = metadata.get("title", "audio_track")
         safe_title = re.sub(r'[^\w\s-]', '', title).strip().replace(' ', '_')
-    except Exception as e:
-        logger.error(f"Metadata fetch for download failed: {url}", exc_info=True)
+    except Exception:
+        logger.error(f"Metadata fetch failed for download: {url}", exc_info=True)
         safe_title = "audio_track"
 
-    cmd = ytdlp_base()
+    args = get_ytdlp_base_arguments()
     if format.lower() == "mp3":
-        cmd += ["-f", "ba", "-x", "--audio-format", "mp3", "-o", "-", "--no-playlist", url]
+        args += ["-f", "ba", "-x", "--audio-format", "mp3", "-o", "-", "--no-playlist", url]
         filename = f"{safe_title}.mp3"
         media_type = "audio/mpeg"
     else:
-        cmd += ["-f", "ba", "-o", "-", "--no-playlist", url]
+        args += ["-f", "ba", "-o", "-", "--no-playlist", url]
         filename = f"{safe_title}.m4a"
         media_type = "audio/mp4"
 
     try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        process = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
     except Exception as e:
-        logger.error(f"Download process start failed: {url}", exc_info=True)
-        raise HTTPException(400, "Could not start download, please try again later.")
+        logger.error(f"Download process creation failed: {e}")
+        raise HTTPException(status_code=400, detail="Could not start download, please try again later.")
 
-    def generate():
+    async def download_generator() -> AsyncGenerator[bytes, None]:
         try:
             while True:
-                chunk = proc.stdout.read(8192)
+                chunk = await asyncio.wait_for(process.stdout.read(8192), timeout=30.0)
                 if not chunk:
                     break
                 yield chunk
+        except asyncio.TimeoutError:
+            logger.error("Download stream read timeout")
+            if process.returncode is None:
+                process.kill()
+                await process.wait()
         finally:
-            proc.terminate()
-            proc.wait()
+            if process.returncode is None:
+                try:
+                    process.kill()
+                    await process.wait()
+                except Exception:
+                    pass
 
     return StreamingResponse(
-        generate(),
+        download_generator(),
         media_type=media_type,
         headers={"Content-Disposition": f"attachment; filename={filename}"}
     )
 
-
-# ==========================================
-# ARTIST SEARCH, PORTFOLIO & DIRECT MUSIC LINK APIS
-# ==========================================
-
 @app.get("/api/music/artist/search")
 async def api_music_artist_search(q: str, limit: int = 5):
     if not q:
-        raise HTTPException(400, "Artist search query is required")
+        raise HTTPException(status_code=400, detail="Artist search query is required")
     try:
-        encoded_q = urllib.parse.quote_plus(q)
-        search_url = f"https://www.youtube.com/results?search_query={encoded_q}&sp=EgIQAg%253D%253D"
-
-        cmd = ytdlp_base() + [
-            "--flat-playlist", "--dump-single-json", "--playlist-end", str(limit), "--no-warnings", search_url
+        encoded_query = urllib.parse.quote_plus(q)
+        search_url = f"https://music.youtube.com/search?q={encoded_query}"
+        args = get_ytdlp_base_arguments() + [
+            "--flat-playlist", "--dump-single-json",
+            "--playlist-end", str(limit), "--no-warnings", search_url
         ]
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        if res.returncode != 0:
-            raise RuntimeError(res.stderr.strip())
+        process = await asyncio.create_subprocess_exec(
+            *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=120)
+        except asyncio.TimeoutError:
+            if process.returncode is None:
+                process.kill()
+                await process.wait()
+            logger.error(f"Artist search timed out for: {q}")
+            raise HTTPException(status_code=408, detail="Operation timed out")
 
-        data = json.loads(res.stdout.strip())
+        if process.returncode != 0:
+            err = stderr.decode(errors="ignore").strip()
+            logger.error(f"yt-dlp artist search error: {err}")
+            raise HTTPException(status_code=400, detail="Artist search failed.")
+
+        try:
+            data = json.loads(stdout.decode(errors="ignore").strip())
+        except json.JSONDecodeError as e:
+            logger.error(f"Invalid JSON from artist search: {e}")
+            raise HTTPException(status_code=400, detail="Malformed response from video provider.")
+
         entries = data.get("entries", [])
         artists = []
         for e in entries:
+            if not e:
+                continue
             artist_id = e.get("id")
             if not artist_id:
                 continue
@@ -422,47 +603,63 @@ async def api_music_artist_search(q: str, limit: int = 5):
                 "id": artist_id,
                 "name": e.get("title") or "Unknown Artist",
                 "thumbnail": e.get("thumbnail") or f"https://i.ytimg.com/vi/{artist_id}/mqdefault.jpg",
-                "channel_url": e.get("url") or f"https://www.youtube.com/channel/{artist_id}"
+                "channel_url": f"https://music.youtube.com/channel/{artist_id}"
             })
         return {"artists": artists}
+
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Artist search failed: q={q}", exc_info=True)
-        raise HTTPException(400, "Artist search failed, please try again later.")
+        logger.error(f"Unexpected error in artist search: q={q}", exc_info=True)
+        raise HTTPException(status_code=400, detail="An unexpected backend error occurred.")
 
 @app.get("/api/music/artist/page")
 async def api_music_artist_page(url: str, limit: int = 30):
     if not url.startswith(("http://", "https://")):
-        raise HTTPException(400, "Invalid artist URL")
-    
-    # We prioritize "/releases" to capture pure high-fidelity studio releases (Albums/EPs/Singles)
-    # over standard video uploads which might contain voiceovers, visual effects, and compression compromises.
+        raise HTTPException(status_code=400, detail="Invalid artist URL")
+
+    if "youtube.com" in url and "music.youtube.com" not in url:
+        url = url.replace("youtube.com", "music.youtube.com")
+
     target_url = url
     if any(x in url for x in ["/channel/", "/user/", "/c/", "@"]):
-        parts = list(urllib.parse.urlparse(url))
-        path = parts[2].rstrip("/")
-        if not any(path.endswith(suffix) for suffix in ["/videos", "/releases", "/shorts", "/playlists", "/featured"]):
-            parts[2] = path + "/releases"
-            target_url = urllib.parse.urlunparse(parts)
+        parsed_url = list(urllib.parse.urlparse(url))
+        sanitized_path = parsed_url[2].rstrip("/")
+        if not any(sanitized_path.endswith(suf) for suf in ["/videos", "/releases", "/shorts", "/playlists", "/featured"]):
+            parsed_url[2] = sanitized_path + "/releases"
+            target_url = urllib.parse.urlunparse(parsed_url)
 
     try:
-        # Step 1: Try reading from the pure Studio Releases tab
-        cmd = ytdlp_base() + [
-            "--flat-playlist", "--dump-single-json", "--playlist-end", str(limit), "--no-warnings", target_url
-        ]
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        
-        # Step 2: Fall back to "/playlists" or "/videos" if the artist has no Official Studio Release listings (e.g., smaller or non-OAC channels)
-        if res.returncode != 0 and "/releases" in target_url:
-            fallback_url = target_url.replace("/releases", "/videos")
-            cmd = ytdlp_base() + [
-                "--flat-playlist", "--dump-single-json", "--playlist-end", str(limit), "--no-warnings", fallback_url
+        async def run_artist_page(target):
+            args = get_ytdlp_base_arguments() + [
+                "--flat-playlist", "--dump-single-json",
+                "--playlist-end", str(limit), "--no-warnings", target
             ]
-            res = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            proc = await asyncio.create_subprocess_exec(
+                *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            )
+            out, err = await asyncio.wait_for(proc.communicate(), timeout=120)
+            return proc, out, err
 
-        if res.returncode != 0:
-            raise RuntimeError(res.stderr.strip())
+        process, stdout, stderr = await run_artist_page(target_url)
+        is_fallback = False
 
-        data = json.loads(res.stdout.strip())
+        if process.returncode != 0 and "/releases" in target_url:
+            is_fallback = True
+            fallback_url = target_url.replace("/releases", "/videos")
+            process, stdout, stderr = await run_artist_page(fallback_url)
+
+        if process.returncode != 0:
+            err = stderr.decode(errors="ignore").strip()
+            logger.error(f"yt-dlp artist page error: {err}")
+            raise HTTPException(status_code=400, detail="Artist page fetch failed.")
+
+        try:
+            data = json.loads(stdout.decode(errors="ignore").strip())
+        except json.JSONDecodeError as e:
+            logger.error(f"Invalid JSON from artist page: {e}")
+            raise HTTPException(status_code=400, detail="Malformed response from video provider.")
+
         entries = data.get("entries", [])
         tracks = []
         for i, e in enumerate(entries):
@@ -474,39 +671,64 @@ async def api_music_artist_page(url: str, limit: int = 30):
                 "id": track_id,
                 "title": e.get("title") or f"Track {i+1}",
                 "thumbnail": e.get("thumbnail") or (f"https://i.ytimg.com/vi/{track_id}/mqdefault.jpg" if track_id else None),
-                "duration_str": seconds_to_ts(e.get("duration") or 0),
-                "url": e.get("url") or e.get("webpage_url") or f"https://www.youtube.com/watch?v={track_id}",
+                "duration_str": format_duration_string(e.get("duration") or 0),
+                "url": e.get("url") or e.get("webpage_url") or f"https://music.youtube.com/watch?v={track_id}",
             })
-        
-        # Display context-aware descriptive header sub-text
-        is_pure = "/releases" in target_url and res.returncode == 0
-        desc_label = "Official Studio Master Releases" if is_pure else "Latest Uploaded Releases"
+
+        is_pure_releases = ("/releases" in target_url) and not is_fallback
+        description = "Official Studio Master Releases" if is_pure_releases else "Latest Uploaded Releases"
 
         return {
             "artist_name": data.get("title") or "Artist Page",
             "count": len(tracks),
             "tracks": tracks,
-            "description": desc_label
+            "description": description
         }
+
+    except HTTPException:
+        raise
+    except asyncio.TimeoutError:
+        logger.error(f"Artist page timed out: {url}")
+        raise HTTPException(status_code=408, detail="Operation timed out")
     except Exception as e:
-        logger.error(f"Artist page fetch failed: {url}", exc_info=True)
-        raise HTTPException(400, "Could not fetch artist releases, please try again later.")
+        logger.error(f"Unexpected error in artist page: {url}", exc_info=True)
+        raise HTTPException(status_code=400, detail="An unexpected backend error occurred.")
 
 @app.get("/api/music/link")
 async def api_music_link(url: str):
     if not url.startswith(("http://", "https://")):
-        raise HTTPException(400, "Invalid URL")
+        raise HTTPException(status_code=400, detail="Invalid URL")
+
+    if "youtube.com" in url and "music.youtube.com" not in url:
+        url = url.replace("youtube.com", "music.youtube.com")
+
     try:
         is_playlist = "list=" in url and "watch?v=" not in url
-        
         if is_playlist:
-            cmd = ytdlp_base() + [
-                "--flat-playlist", "--dump-single-json", "--no-warnings", url
-            ]
-            res = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-            if res.returncode != 0:
-                raise RuntimeError(res.stderr.strip())
-            data = json.loads(res.stdout.strip())
+            args = get_ytdlp_base_arguments() + ["--flat-playlist", "--dump-single-json", "--no-warnings", url]
+            process = await asyncio.create_subprocess_exec(
+                *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            )
+            try:
+                stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=120)
+            except asyncio.TimeoutError:
+                if process.returncode is None:
+                    process.kill()
+                    await process.wait()
+                logger.error(f"Music link playlist timed out: {url}")
+                raise HTTPException(status_code=408, detail="Operation timed out")
+
+            if process.returncode != 0:
+                err = stderr.decode(errors="ignore").strip()
+                logger.error(f"yt-dlp link playlist error: {err}")
+                raise HTTPException(status_code=400, detail="Failed to fetch playlist.")
+
+            try:
+                data = json.loads(stdout.decode(errors="ignore").strip())
+            except json.JSONDecodeError as e:
+                logger.error(f"Invalid JSON from link playlist: {e}")
+                raise HTTPException(status_code=400, detail="Malformed response from video provider.")
+
             entries = data.get("entries", [])
             results = []
             for i, e in enumerate(entries):
@@ -519,27 +741,33 @@ async def api_music_link(url: str):
                     "uploader": e.get("uploader") or e.get("channel") or data.get("title") or "Unknown Artist",
                     "thumbnail": e.get("thumbnail") or (f"https://i.ytimg.com/vi/{vid_id}/mqdefault.jpg" if vid_id else None),
                     "duration": e.get("duration") or 0,
-                    "duration_str": seconds_to_ts(e.get("duration") or 0),
-                    "url": f"https://www.youtube.com/watch?v={vid_id}" if vid_id else (e.get("url") or e.get("webpage_url")),
+                    "duration_str": format_duration_string(e.get("duration") or 0),
+                    "url": f"https://music.youtube.com/watch?v={vid_id}" if vid_id else (e.get("url") or e.get("webpage_url")),
                 })
             return {"results": results, "title": data.get("title", "Album")}
         else:
-            meta = get_video_metadata(url)
-            vid_id = meta.get("id")
+            metadata = await fetch_video_metadata(url)
+            vid_id = metadata.get("id")
             track = {
                 "id": vid_id,
-                "title": meta.get("title") or "Unknown Track",
-                "uploader": meta.get("uploader") or meta.get("channel") or "Unknown Artist",
-                "thumbnail": meta.get("thumbnail") or (f"https://i.ytimg.com/vi/{vid_id}/mqdefault.jpg" if vid_id else None),
-                "duration": meta.get("duration") or 0,
-                "duration_str": seconds_to_ts(meta.get("duration") or 0),
+                "title": metadata.get("title") or "Unknown Track",
+                "uploader": metadata.get("uploader") or metadata.get("channel") or "Unknown Artist",
+                "thumbnail": metadata.get("thumbnail") or (f"https://i.ytimg.com/vi/{vid_id}/mqdefault.jpg" if vid_id else None),
+                "duration": metadata.get("duration") or 0,
+                "duration_str": format_duration_string(metadata.get("duration") or 0),
                 "url": url,
             }
-            return {"results": [track], "title": meta.get("title", "Track")}
-    except Exception as e:
-        logger.error(f"Music link processing failed: {url}", exc_info=True)
-        raise HTTPException(400, "Could not process the music link, please try again later.")
+            return {"results": [track], "title": metadata.get("title", "Track")}
 
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error in music link: {url}", exc_info=True)
+        raise HTTPException(status_code=400, detail="An unexpected backend error occurred.")
+
+# ────────────────────────────────────────────────────────────────────────────
+# STATIC HTML UI (unchanged)
+# ────────────────────────────────────────────────────────────────────────────
 
 HTML = r"""<!DOCTYPE html>
 <html lang="en">
@@ -2089,8 +2317,8 @@ document.getElementById('musicQuery').addEventListener('keydown', e => {
 </script>
 </body>
 </html>
-
 """
+
 @app.get("/", response_class=HTMLResponse)
 async def root():
     return HTML
