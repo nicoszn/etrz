@@ -1,3 +1,4 @@
+import os
 import re
 import json
 import uuid
@@ -12,10 +13,14 @@ from pydantic import BaseModel
 
 BASE_DIR = Path(__file__).parent
 COOKIES = BASE_DIR / "cookies.txt"
+DOWNLOADS = BASE_DIR / "downloads"
 TEMP = BASE_DIR / "temp"
+
+DOWNLOADS.mkdir(exist_ok=True)
 TEMP.mkdir(exist_ok=True)
 
 app = FastAPI(title="YTE")
+
 JOBS = {}
 
 def job_set(job_id, state, data=None, error=None):
@@ -23,9 +28,10 @@ def job_set(job_id, state, data=None, error=None):
 
 def seconds_to_ts(s: float) -> str:
     s = round(s, 3)
-    h, rem = divmod(s, 3600)
-    m, sec = divmod(rem, 60)
-    return f"{int(h):02d}:{int(m):02d}:{sec:06.3f}"
+    h = int(s // 3600)
+    m = int((s % 3600) // 60)
+    sec = s % 60
+    return f"{h:02d}:{m:02d}:{sec:06.3f}"
 
 def ytdlp_base():
     cmd = ["yt-dlp"]
@@ -46,6 +52,9 @@ def extract_plain_text_from_vtt(vtt_path: Path) -> str:
                     lines.append(clean)
     return ' '.join(lines)
 
+def get_file_size_mb(path):
+    return round(path.stat().st_size / (1024 * 1024), 2) if path.exists() else 0.0
+
 def get_video_metadata(url: str) -> dict:
     cmd = ytdlp_base() + ["--dump-json", "--no-playlist", url]
     res = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
@@ -56,6 +65,7 @@ def get_video_metadata(url: str) -> dict:
 def normalize_formats(metadata: dict) -> list:
     formats = metadata.get("formats", [])
     res_map = defaultdict(list)
+
     container_priority = {"mp4": 1, "m4a": 2, "webm": 3, "mkv": 4, "avi": 5, "mov": 6}
     codec_priority = {"hevc": 1, "h265": 1, "avc1": 2, "h264": 2, "vp9": 3, "av01": 4, "vp8": 5}
 
@@ -68,33 +78,52 @@ def normalize_formats(metadata: dict) -> list:
                 height = None
         if height is None or height < 360:
             continue
+
         size_mb = None
         if f.get("filesize"):
             size_mb = round(f["filesize"] / (1024 * 1024), 1)
         elif f.get("filesize_approx"):
             size_mb = round(f["filesize_approx"] / (1024 * 1024), 1)
+
         ext = f.get("ext", "").lower()
         vcodec = f.get("vcodec", "").lower()
         codec = vcodec.split('.')[0] if vcodec else "unknown"
+
         container_score = container_priority.get(ext, 99)
         codec_score = codec_priority.get(codec, 99)
         has_both = (f.get("vcodec") != "none" and f.get("acodec") != "none")
-        rank = (container_score, codec_score, size_mb if size_mb is not None else 1e9, -10 if has_both else 0)
-        res_map[height].append({"format_id": f["format_id"], "resolution": f"{height}p", "ext": ext, "size_mb": size_mb, "rank": rank})
+        both_bonus = -10 if has_both else 0
+        size_score = size_mb if size_mb is not None else 1e9
+
+        rank = (container_score, codec_score, size_score, both_bonus)
+        res_map[height].append({
+            "format_id": f["format_id"],
+            "resolution": f"{height}p",
+            "ext": ext,
+            "size_mb": size_mb,
+            "rank": rank
+        })
 
     unique = []
     for height, entries in res_map.items():
         entries.sort(key=lambda x: x["rank"])
         best = entries[0]
-        unique.append({"format_id": best["format_id"], "resolution": best["resolution"], "ext": best["ext"], "size_mb": best["size_mb"]})
+        unique.append({
+            "format_id": best["format_id"],
+            "resolution": best["resolution"],
+            "ext": best["ext"],
+            "size_mb": best["size_mb"],
+        })
     unique.sort(key=lambda x: int(x["resolution"].rstrip("p")), reverse=True)
     return unique
 
 def subtitle_worker(job_id, url):
     try:
+        meta = get_video_metadata(url)
         tmp_base = TEMP / f"sub_{job_id}"
         sub_cmd = ytdlp_base() + ["--skip-download", "--write-auto-subs", "--write-subs",
-                                  "--sub-langs", "en", "--sub-format", "vtt", "-o", str(tmp_base), url]
+                                  "--sub-langs", "en", "--sub-format", "vtt",
+                                  "-o", str(tmp_base), url]
         subprocess.run(sub_cmd, capture_output=True, timeout=60)
         vtt_path = Path(str(tmp_base) + ".en.vtt")
         sub_text = extract_plain_text_from_vtt(vtt_path)
@@ -106,51 +135,16 @@ def subtitle_worker(job_id, url):
 class UrlRequest(BaseModel):
     url: str
 
-def is_playlist_url(url: str) -> bool:
-    return "list=" in url and "watch?v=" not in url
-
-@app.post("/api/detect")
-async def api_detect(req: UrlRequest):
-    return {"is_playlist": is_playlist_url(req.url)}
-
-@app.post("/api/playlist")
-async def api_playlist(req: UrlRequest):
-    try:
-        cmd = ytdlp_base() + [
-            "--flat-playlist", "--dump-single-json", "--no-warnings", req.url
-        ]
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        if res.returncode != 0:
-            raise RuntimeError(res.stderr.strip())
-        data = json.loads(res.stdout.strip())
-        entries = data.get("entries", [])
-        videos = []
-        for i, e in enumerate(entries):
-            vid_id = e.get("id") or e.get("url", "").split("v=")[-1]
-            videos.append({
-                "index": i,
-                "id": vid_id,
-                "title": e.get("title") or e.get("webpage_url_basename") or f"Video {i+1}",
-                "thumbnail": e.get("thumbnail") or (f"https://i.ytimg.com/vi/{vid_id}/mqdefault.jpg" if vid_id else None),
-                "duration_str": seconds_to_ts(e.get("duration") or 0),
-                "url": e.get("url") or e.get("webpage_url") or f"https://www.youtube.com/watch?v={vid_id}",
-            })
-        return {
-            "playlist_title": data.get("title", "Playlist"),
-            "count": len(videos),
-            "videos": videos
-        }
-    except Exception as e:
-        raise HTTPException(400, str(e))
-
 @app.post("/api/formats")
 async def api_formats(req: UrlRequest):
     try:
         meta = get_video_metadata(req.url)
         formats = normalize_formats(meta)
+
         job_id = str(uuid.uuid4())
         job_set(job_id, "running")
         threading.Thread(target=subtitle_worker, args=(job_id, req.url), daemon=True).start()
+
         return {
             "video_id": meta.get("id"),
             "title": meta.get("title"),
@@ -177,7 +171,7 @@ async def stream_video(url: str, format_id: str):
                 break
             yield chunk
     return StreamingResponse(generate(), media_type="video/mp4",
-                             headers={"Content-Disposition": f"attachment; filename=video_{format_id}.mp4"})
+                            headers={"Content-Disposition": f"attachment; filename=video_{format_id}.mp4"})
 
 @app.get("/api/job/{job_id}")
 async def api_job(job_id: str):
@@ -196,13 +190,13 @@ HTML = r"""<!DOCTYPE html>
   --bg: #080809;
   --surface: #0f0f12;
   --surface2: #16161b;
-  --surface3: #1c1c22;
   --border: #1e1e26;
   --border2: #2a2a35;
   --text: #e2e2ea;
   --muted: #55556a;
   --accent: #c8ff57;
-  --accent-dim: rgba(200,255,87,0.07);
+  --accent-dim: rgba(200,255,87,0.08);
+  --accent-glow: rgba(200,255,87,0.15);
   --err: #ff4f4f;
   --err-dim: rgba(255,79,79,0.08);
   --r: 10px;
@@ -221,7 +215,13 @@ body {
   padding: 3rem 1rem 6rem;
 }
 
-.wrap { width: 100%; max-width: 720px; display: flex; flex-direction: column; }
+.wrap {
+  width: 100%;
+  max-width: 680px;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
 
 header {
   display: flex;
@@ -239,7 +239,11 @@ header {
   text-transform: uppercase;
 }
 
-.logo-sub { font-size: 0.65rem; color: var(--muted); letter-spacing: 0.04em; }
+.logo-sub {
+  font-size: 0.65rem;
+  color: var(--muted);
+  letter-spacing: 0.04em;
+}
 
 .panel {
   background: var(--surface);
@@ -248,7 +252,14 @@ header {
   overflow: hidden;
 }
 
-.input-row { display: flex; align-items: center; }
+.panel + .panel { margin-top: 1px; }
+
+.input-row {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  padding: 0;
+}
 
 .url-input {
   flex: 1;
@@ -265,7 +276,7 @@ header {
 
 .url-input::placeholder { color: var(--muted); }
 
-.run-btn {
+.analyze-btn {
   background: var(--accent);
   color: #080809;
   border: none;
@@ -283,13 +294,16 @@ header {
   flex-shrink: 0;
 }
 
-.run-btn:hover { opacity: 0.85; }
-.run-btn:active { transform: scale(0.97); }
-.run-btn:disabled { opacity: 0.35; cursor: not-allowed; transform: none; }
+.analyze-btn:hover { opacity: 0.85; }
+.analyze-btn:active { transform: scale(0.97); }
+.analyze-btn:disabled { opacity: 0.35; cursor: not-allowed; transform: none; }
+
+.divider { height: 1px; background: var(--border); }
 
 .progress-track {
   height: 2px;
   background: var(--border);
+  position: relative;
   overflow: hidden;
   opacity: 0;
   transition: opacity 0.2s;
@@ -301,6 +315,7 @@ header {
   height: 100%;
   width: 0%;
   background: var(--accent);
+  transition: width 0.3s ease;
   border-radius: 2px;
 }
 
@@ -327,9 +342,15 @@ header {
 
 .status.ok { color: var(--accent); }
 .status.err { color: var(--err); background: var(--err-dim); }
-.status-dot { width: 5px; height: 5px; border-radius: 50%; background: currentColor; flex-shrink: 0; }
+.status:empty { display: none; }
 
-.divider { height: 1px; background: var(--border); }
+.status-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: currentColor;
+  flex-shrink: 0;
+}
 
 .meta-panel {
   display: none;
@@ -363,7 +384,14 @@ header {
   overflow: hidden;
 }
 
-.meta-duration { font-size: 0.65rem; color: var(--muted); letter-spacing: 0.06em; }
+.meta-duration {
+  font-size: 0.65rem;
+  color: var(--muted);
+  letter-spacing: 0.06em;
+}
+
+.formats-panel { display: none; }
+.formats-panel.visible { display: block; }
 
 .formats-header {
   display: grid;
@@ -386,14 +414,30 @@ header {
   align-items: center;
   border-bottom: 1px solid var(--border);
   transition: background 0.12s;
+  cursor: pointer;
 }
 
 .format-row:last-child { border-bottom: none; }
 .format-row:hover { background: var(--surface2); }
 
-.res-badge { font-family: 'Syne', sans-serif; font-weight: 700; font-size: 0.8rem; }
-.ext-badge { font-size: 0.65rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; }
-.size-val { font-size: 0.72rem; color: var(--muted); }
+.res-badge {
+  font-family: 'Syne', sans-serif;
+  font-weight: 700;
+  font-size: 0.8rem;
+  color: var(--text);
+}
+
+.ext-badge {
+  font-size: 0.65rem;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.size-val {
+  font-size: 0.72rem;
+  color: var(--muted);
+}
 
 .dl-btn {
   background: transparent;
@@ -409,14 +453,17 @@ header {
   white-space: nowrap;
 }
 
-.dl-btn:hover { border-color: var(--accent); color: var(--accent); background: var(--accent-dim); }
+.dl-btn:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--accent-dim);
+}
 
 .actions-row {
   display: none;
   padding: 16px 20px;
   border-top: 1px solid var(--border);
   gap: 10px;
-  align-items: center;
 }
 
 .actions-row.visible { display: flex; }
@@ -434,155 +481,22 @@ header {
   transition: all 0.15s;
 }
 
-.sub-btn:hover { border-color: var(--accent); color: var(--accent); background: var(--accent-dim); }
+.sub-btn:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--accent-dim);
+}
 
 .copied-flash {
   font-size: 0.65rem;
   color: var(--accent);
   opacity: 0;
   transition: opacity 0.3s;
+  align-self: center;
   letter-spacing: 0.06em;
 }
 
 .copied-flash.show { opacity: 1; }
-
-.playlist-header {
-  display: none;
-  padding: 16px 20px;
-  border-top: 1px solid var(--border);
-  gap: 10px;
-  align-items: baseline;
-}
-
-.playlist-header.visible { display: flex; }
-
-.playlist-title {
-  font-family: 'Syne', sans-serif;
-  font-weight: 700;
-  font-size: 0.82rem;
-  flex: 1;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.playlist-count { font-size: 0.65rem; color: var(--muted); letter-spacing: 0.06em; flex-shrink: 0; }
-
-.playlist-list {
-  display: none;
-  border-top: 1px solid var(--border);
-}
-
-.playlist-list.visible { display: block; }
-
-.pl-item {
-  border-bottom: 1px solid var(--border);
-}
-
-.pl-item:last-child { border-bottom: none; }
-
-.pl-row {
-  display: flex;
-  align-items: center;
-  gap: 14px;
-  padding: 12px 20px;
-  cursor: pointer;
-  transition: background 0.12s;
-  user-select: none;
-}
-
-.pl-row:hover { background: var(--surface2); }
-.pl-row.open { background: var(--surface2); }
-
-.pl-thumb {
-  width: 72px;
-  aspect-ratio: 16/9;
-  object-fit: cover;
-  border-radius: 4px;
-  flex-shrink: 0;
-  background: var(--surface3);
-}
-
-.pl-info { flex: 1; min-width: 0; }
-
-.pl-title {
-  font-family: 'Syne', sans-serif;
-  font-weight: 600;
-  font-size: 0.78rem;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  margin-bottom: 4px;
-}
-
-.pl-dur { font-size: 0.62rem; color: var(--muted); letter-spacing: 0.05em; }
-
-.pl-chevron {
-  width: 16px;
-  height: 16px;
-  flex-shrink: 0;
-  color: var(--muted);
-  transition: transform 0.2s ease;
-}
-
-.pl-row.open .pl-chevron { transform: rotate(180deg); }
-
-.pl-formats {
-  display: none;
-  background: var(--surface3);
-  border-top: 1px solid var(--border);
-  padding-bottom: 2px;
-}
-
-.pl-formats.visible { display: block; }
-
-.pl-formats-header {
-  display: grid;
-  grid-template-columns: 1fr 60px 80px 90px;
-  gap: 8px;
-  padding: 8px 20px 8px 106px;
-  font-size: 0.58rem;
-  color: var(--muted);
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
-  border-bottom: 1px solid var(--border);
-}
-
-.pl-format-row {
-  display: grid;
-  grid-template-columns: 1fr 60px 80px 90px;
-  gap: 8px;
-  padding: 11px 20px 11px 106px;
-  align-items: center;
-  border-bottom: 1px solid var(--border);
-  transition: background 0.1s;
-}
-
-.pl-format-row:last-child { border-bottom: none; }
-.pl-format-row:hover { background: rgba(255,255,255,0.02); }
-
-.pl-loading {
-  padding: 14px 20px 14px 106px;
-  font-size: 0.68rem;
-  color: var(--muted);
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.spinner {
-  width: 12px;
-  height: 12px;
-  border: 1.5px solid var(--border2);
-  border-top-color: var(--accent);
-  border-radius: 50%;
-  animation: spin 0.7s linear infinite;
-  flex-shrink: 0;
-}
-
-@keyframes spin { to { transform: rotate(360deg); } }
-
-.pl-err { padding: 12px 20px 12px 106px; font-size: 0.68rem; color: var(--err); }
 </style>
 </head>
 <body>
@@ -594,8 +508,8 @@ header {
 
   <div class="panel">
     <div class="input-row">
-      <input class="url-input" id="url" type="text" placeholder="paste youtube url or playlist" autocomplete="off" spellcheck="false" />
-      <button class="run-btn" id="runBtn" onclick="run()">Run</button>
+      <input class="url-input" id="url" type="text" placeholder="paste youtube url" autocomplete="off" spellcheck="false" />
+      <button class="analyze-btn" id="analyzeBtn" onclick="analyze()">Run</button>
     </div>
 
     <div class="progress-track" id="track">
@@ -608,13 +522,18 @@ header {
       <img class="thumb" id="thumb" src="" alt="" />
       <div class="meta-info">
         <div class="meta-title" id="title"></div>
-        <div class="meta-duration" id="dur"></div>
+        <div class="meta-duration" id="duration"></div>
       </div>
     </div>
 
-    <div id="singleFormatsWrap" style="display:none">
+    <div class="divider" id="metaDivider" style="display:none"></div>
+
+    <div class="formats-panel" id="formats">
       <div class="formats-header">
-        <span>Resolution</span><span>Ext</span><span>Size</span><span></span>
+        <span>Resolution</span>
+        <span>Ext</span>
+        <span>Size</span>
+        <span></span>
       </div>
       <div id="formatRows"></div>
     </div>
@@ -623,22 +542,15 @@ header {
       <button class="sub-btn" id="subBtn" onclick="copySubtitle()" style="display:none">copy transcript</button>
       <span class="copied-flash" id="copiedFlash">copied</span>
     </div>
-
-    <div class="playlist-header" id="plHeader">
-      <span class="playlist-title" id="plTitle"></span>
-      <span class="playlist-count" id="plCount"></span>
-    </div>
-
-    <div class="playlist-list" id="plList"></div>
   </div>
 </div>
 
 <script>
-let _currentUrl = "";
-let _subtitlePollTimer = null;
 let _subtitleText = "";
-
-const formatCache = {};
+let _subtitleJobId = null;
+let _subtitleReady = false;
+let _subtitlePollTimer = null;
+let _currentUrl = "";
 
 function setStatus(type, msg) {
   const el = document.getElementById('status');
@@ -647,42 +559,91 @@ function setStatus(type, msg) {
 }
 
 function setLoading(on) {
-  document.getElementById('track').classList.toggle('active', on);
-  document.getElementById('runBtn').disabled = on;
+  const track = document.getElementById('track');
+  track.classList.toggle('active', on);
+  document.getElementById('analyzeBtn').disabled = on;
 }
 
-function resetAll() {
-  if (_subtitlePollTimer) clearInterval(_subtitlePollTimer);
-  _subtitleText = "";
-  document.getElementById('subBtn').style.display = 'none';
-  document.getElementById('actionsRow').className = 'actions-row';
-  document.getElementById('meta').className = 'meta-panel';
-  document.getElementById('singleFormatsWrap').style.display = 'none';
-  document.getElementById('formatRows').innerHTML = '';
-  document.getElementById('plHeader').className = 'playlist-header';
-  document.getElementById('plList').className = 'playlist-list';
-  document.getElementById('plList').innerHTML = '';
+function showMeta(data) {
+  document.getElementById('thumb').src = data.thumbnail || '';
+  document.getElementById('title').textContent = data.title || '';
+  document.getElementById('duration').textContent = data.duration_str || '';
+  document.getElementById('meta').classList.add('visible');
+  document.getElementById('metaDivider').style.display = '';
 }
 
-async function run() {
+function showFormats(formats) {
+  const rows = document.getElementById('formatRows');
+  rows.innerHTML = '';
+  formats.forEach(f => {
+    const row = document.createElement('div');
+    row.className = 'format-row';
+    row.innerHTML = `
+      <span class="res-badge">${f.resolution}</span>
+      <span class="ext-badge">${f.ext}</span>
+      <span class="size-val">${f.size_mb ? f.size_mb + ' mb' : '—'}</span>
+      <button class="dl-btn" onclick="download('${f.format_id}')">download</button>
+    `;
+    rows.appendChild(row);
+  });
+  document.getElementById('formats').classList.add('visible');
+}
+
+function pollSubtitle(jobId) {
+  _subtitlePollTimer = setInterval(async () => {
+    try {
+      const res = await fetch('/api/job/' + jobId);
+      const data = await res.json();
+      if (data.state === 'done') {
+        clearInterval(_subtitlePollTimer);
+        if (data.data.subtitle_text) {
+          _subtitleText = data.data.subtitle_text;
+          _subtitleReady = true;
+          document.getElementById('subBtn').style.display = '';
+        }
+      } else if (data.state === 'error') {
+        clearInterval(_subtitlePollTimer);
+      }
+    } catch { clearInterval(_subtitlePollTimer); }
+  }, 900);
+}
+
+async function analyze() {
   const url = document.getElementById('url').value.trim();
   if (!url) return;
   _currentUrl = url;
-  resetAll();
+  _subtitleText = "";
+  _subtitleReady = false;
+  _subtitleJobId = null;
+  if (_subtitlePollTimer) clearInterval(_subtitlePollTimer);
+
+  document.getElementById('subBtn').style.display = 'none';
+  document.getElementById('actionsRow').classList.remove('visible');
+  document.getElementById('meta').classList.remove('visible');
+  document.getElementById('formats').classList.remove('visible');
+  document.getElementById('metaDivider').style.display = 'none';
+  document.getElementById('formatRows').innerHTML = '';
+
   setLoading(true);
-  setStatus('', 'detecting...');
+  setStatus('', 'fetching...');
 
   try {
-    const det = await fetch('/api/detect', {
+    const res = await fetch('/api/formats', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ url })
-    }).then(r => r.json());
+    });
+    if (!res.ok) throw new Error(await res.text());
+    const data = await res.json();
 
-    if (det.is_playlist) {
-      await loadPlaylist(url);
-    } else {
-      await loadSingle(url);
+    showMeta(data);
+    showFormats(data.formats);
+    setStatus('ok', `${data.formats.length} formats`);
+    document.getElementById('actionsRow').classList.add('visible');
+
+    if (data.subtitle_job_id) {
+      _subtitleJobId = data.subtitle_job_id;
+      pollSubtitle(_subtitleJobId);
     }
   } catch (err) {
     setStatus('err', err.message);
@@ -691,159 +652,17 @@ async function run() {
   }
 }
 
-async function loadSingle(url) {
-  setStatus('', 'fetching...');
-  const res = await fetch('/api/formats', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ url })
-  });
-  if (!res.ok) throw new Error(await res.text());
-  const data = await res.json();
-
-  document.getElementById('thumb').src = data.thumbnail || '';
-  document.getElementById('title').textContent = data.title || '';
-  document.getElementById('dur').textContent = data.duration_str || '';
-  document.getElementById('meta').classList.add('visible');
-
-  renderFormatRows(data.formats, document.getElementById('formatRows'), url);
-  document.getElementById('singleFormatsWrap').style.display = '';
-  document.getElementById('actionsRow').classList.add('visible');
-  setStatus('ok', `${data.formats.length} formats`);
-
-  if (data.subtitle_job_id) {
-    _subtitlePollTimer = setInterval(async () => {
-      try {
-        const j = await fetch('/api/job/' + data.subtitle_job_id).then(r => r.json());
-        if (j.state === 'done') {
-          clearInterval(_subtitlePollTimer);
-          if (j.data.subtitle_text) {
-            _subtitleText = j.data.subtitle_text;
-            document.getElementById('subBtn').style.display = '';
-          }
-        } else if (j.state === 'error') {
-          clearInterval(_subtitlePollTimer);
-        }
-      } catch { clearInterval(_subtitlePollTimer); }
-    }, 900);
-  }
-}
-
-async function loadPlaylist(url) {
-  setStatus('', 'loading playlist...');
-  const res = await fetch('/api/playlist', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ url })
-  });
-  if (!res.ok) throw new Error(await res.text());
-  const data = await res.json();
-
-  document.getElementById('plTitle').textContent = data.playlist_title || 'Playlist';
-  document.getElementById('plCount').textContent = `${data.count} videos`;
-  document.getElementById('plHeader').classList.add('visible');
-
-  const list = document.getElementById('plList');
-  list.innerHTML = '';
-  data.videos.forEach(v => list.appendChild(buildPlItem(v)));
-  list.classList.add('visible');
-  setStatus('ok', `${data.count} videos`);
-}
-
-function buildPlItem(v) {
-  const item = document.createElement('div');
-  item.className = 'pl-item';
-  item.dataset.idx = v.index;
-
-  const row = document.createElement('div');
-  row.className = 'pl-row';
-  row.innerHTML = `
-    <img class="pl-thumb" src="${v.thumbnail || ''}" alt="" loading="lazy" />
-    <div class="pl-info">
-      <div class="pl-title">${escHtml(v.title)}</div>
-      <div class="pl-dur">${v.duration_str || ''}</div>
-    </div>
-    <svg class="pl-chevron" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
-      <path d="M4 6l4 4 4-4"/>
-    </svg>
-  `;
-
-  const formatsBox = document.createElement('div');
-  formatsBox.className = 'pl-formats';
-  item.appendChild(row);
-  item.appendChild(formatsBox);
-
-  let loaded = false;
-  let open = false;
-
-  row.addEventListener('click', async () => {
-    open = !open;
-    row.classList.toggle('open', open);
-    formatsBox.classList.toggle('visible', open);
-
-    if (open && !loaded) {
-      loaded = true;
-      if (formatCache[v.id]) {
-        renderPlFormats(formatCache[v.id], formatsBox, v.url);
-      } else {
-        formatsBox.innerHTML = `<div class="pl-loading"><span class="spinner"></span>fetching formats...</div>`;
-        try {
-          const res = await fetch('/api/formats', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ url: v.url })
-          });
-          if (!res.ok) throw new Error(await res.text());
-          const data = await res.json();
-          formatCache[v.id] = data.formats;
-          renderPlFormats(data.formats, formatsBox, v.url);
-        } catch (err) {
-          formatsBox.innerHTML = `<div class="pl-err">${escHtml(err.message)}</div>`;
-          loaded = false;
-        }
-      }
-    }
-  });
-
-  return item;
-}
-
-function renderPlFormats(formats, container, videoUrl) {
-  let html = `<div class="pl-formats-header"><span>Resolution</span><span>Ext</span><span>Size</span><span></span></div>`;
-  formats.forEach(f => {
-    html += `<div class="pl-format-row">
-      <span class="res-badge">${f.resolution}</span>
-      <span class="ext-badge">${f.ext}</span>
-      <span class="size-val">${f.size_mb ? f.size_mb + ' mb' : '—'}</span>
-      <button class="dl-btn" onclick="dlStream(${JSON.stringify(videoUrl)}, ${JSON.stringify(f.format_id)})">download</button>
-    </div>`;
-  });
-  container.innerHTML = html;
-}
-
-function renderFormatRows(formats, container, videoUrl) {
-  container.innerHTML = '';
-  formats.forEach(f => {
-    const row = document.createElement('div');
-    row.className = 'format-row';
-    row.innerHTML = `
-      <span class="res-badge">${f.resolution}</span>
-      <span class="ext-badge">${f.ext}</span>
-      <span class="size-val">${f.size_mb ? f.size_mb + ' mb' : '—'}</span>
-      <button class="dl-btn" onclick="dlStream(${JSON.stringify(videoUrl)}, ${JSON.stringify(f.format_id)})">download</button>
-    `;
-    container.appendChild(row);
-  });
-}
-
-function dlStream(url, formatId) {
-  window.location.href = `/api/stream?url=${encodeURIComponent(url)}&format_id=${encodeURIComponent(formatId)}`;
+function download(formatId) {
+  const url = _currentUrl;
+  if (!url) return;
+  window.location.href = `/api/stream?url=${encodeURIComponent(url)}&format_id=${formatId}`;
 }
 
 async function copySubtitle() {
   if (!_subtitleText) return;
-  try { await navigator.clipboard.writeText(_subtitleText); }
-  catch {
+  try {
+    await navigator.clipboard.writeText(_subtitleText);
+  } catch {
     const ta = document.createElement('textarea');
     ta.value = _subtitleText;
     document.body.appendChild(ta);
@@ -851,17 +670,13 @@ async function copySubtitle() {
     document.execCommand('copy');
     document.body.removeChild(ta);
   }
-  const f = document.getElementById('copiedFlash');
-  f.classList.add('show');
-  setTimeout(() => f.classList.remove('show'), 1800);
-}
-
-function escHtml(str) {
-  return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  const flash = document.getElementById('copiedFlash');
+  flash.classList.add('show');
+  setTimeout(() => flash.classList.remove('show'), 1800);
 }
 
 document.getElementById('url').addEventListener('keydown', e => {
-  if (e.key === 'Enter') run();
+  if (e.key === 'Enter') analyze();
 });
 </script>
 </body>
